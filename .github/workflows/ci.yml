@@ -1,0 +1,58 @@
+name: CI / Build & Test
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y build-essential cmake git libgtest-dev apache2-utils
+
+      - name: Configure CMake (Release)
+        run: |
+          cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+
+      - name: Build All Targets
+        run: |
+          cmake --build build -j$(nproc)
+
+      - name: Run Test Suite (CTest)
+        run: |
+          cd build && ctest --output-on-failure
+
+      - name: Run Automated E2E Validation
+        run: |
+          python3 scripts/e2e_test.py
+
+  sanitizers:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y build-essential cmake git libgtest-dev
+
+      - name: Configure ASan & UBSan
+        run: |
+          cmake -B build-asan -S . -DENABLE_ASAN=ON -DBUILD_TESTING=ON
+
+      - name: Build with ASan & UBSan
+        run: |
+          cmake --build build-asan -j$(nproc)
+
+      - name: Run Tests with Sanitizers
+        run: |
+          cd build-asan && ctest --output-on-failure

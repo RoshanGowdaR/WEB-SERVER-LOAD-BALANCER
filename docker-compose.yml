@@ -1,0 +1,46 @@
+version: '3.8'
+
+services:
+  load-balancer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    depends_on:
+      - backend-1
+      - backend-2
+      - backend-3
+    environment:
+      - ENVIRONMENT=production
+    restart: unless-stopped
+    networks:
+      - lb-net
+
+  backend-1:
+    image: python:3.11-alpine
+    command: python -m http.server 9001
+    networks:
+      - lb-net
+    expose:
+      - "9001"
+
+  backend-2:
+    image: python:3.11-alpine
+    command: python -m http.server 9002
+    networks:
+      - lb-net
+    expose:
+      - "9002"
+
+  backend-3:
+    image: python:3.11-alpine
+    command: python -m http.server 9003
+    networks:
+      - lb-net
+    expose:
+      - "9003"
+
+networks:
+  lb-net:
+    driver: bridge
