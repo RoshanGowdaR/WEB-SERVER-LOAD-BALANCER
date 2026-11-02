@@ -4,6 +4,7 @@
 #include "logging/logger.h"
 #include <csignal>
 #include <poll.h>
+#include <chrono>
 
 namespace server {
 
@@ -117,7 +118,27 @@ void TcpServer::handle_client(net::Socket client_sock, std::string client_ip, ui
     char buffer[4096];
     const size_t max_total_allowed = config_.max_header_size + config_.max_body_size;
 
+    // Monotonic clock absolute deadline to prevent Slowloris slow-trickle attacks
+    auto request_start = std::chrono::steady_clock::now();
+    auto request_deadline = request_start + config_.connection_timeout;
+
     while (running_.load()) {
+        auto now = std::chrono::steady_clock::now();
+        if (now >= request_deadline) {
+            http::HttpResponse timeout_resp = http::HttpResponse::make_error(
+                http::StatusCode::RequestTimeout,
+                "Request timeout: client did not complete request within deadline"
+            );
+            timeout_resp.set_header("Connection", "close");
+            std::string s = timeout_resp.to_string();
+            client_sock.send_all(s.data(), s.size());
+            return;
+        }
+
+        // Dynamically clamp receive timeout so slow drips cannot exceed the absolute deadline
+        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(request_deadline - now);
+        client_sock.set_receive_timeout(std::max(std::chrono::milliseconds(1), remaining));
+
         ssize_t bytes = client_sock.receive(buffer, sizeof(buffer));
         if (bytes <= 0) {
             // Client closed connection or receive timed out
@@ -171,6 +192,8 @@ void TcpServer::handle_client(net::Socket client_sock, std::string client_ip, ui
                 }
 
                 parser.reset();
+                request_start = std::chrono::steady_clock::now();
+                request_deadline = request_start + config_.connection_timeout;
             } else if (res == http::ParseResult::Error) {
                 http::HttpResponse err_resp = http::HttpResponse::make_error(
                     parser.get_error_status(),
@@ -180,7 +203,7 @@ void TcpServer::handle_client(net::Socket client_sock, std::string client_ip, ui
                 client_sock.send_all(s.data(), s.size());
                 return;
             } else {
-                // ParseResult::Incomplete: Need more data from client
+                // ParseResult::Incomplete: Need more data from client within remaining deadline
                 break;
             }
         }

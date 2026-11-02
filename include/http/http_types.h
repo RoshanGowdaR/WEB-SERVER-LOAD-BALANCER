@@ -17,6 +17,10 @@ enum class Method {
 };
 
 enum class StatusCode {
+    Continue = 100,
+    SwitchingProtocols = 101,
+    Processing = 102,
+    EarlyHints = 103,
     OK = 200,
     Created = 201,
     Accepted = 202,

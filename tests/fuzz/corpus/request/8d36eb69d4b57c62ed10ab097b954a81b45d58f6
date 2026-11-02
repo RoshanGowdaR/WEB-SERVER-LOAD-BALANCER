@@ -1,0 +1,5 @@
+GET /api/v1/resourcce?23 HTTP/1.1
+Host:0
+UsrAgt:
+Accept:
+

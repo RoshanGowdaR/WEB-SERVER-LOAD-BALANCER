@@ -75,6 +75,6 @@ TEST(HealthCheckerTest, BackendRecoveryHysteresis) {
         net::ClientSocket wake_sock;
         wake_sock.connect("127.0.0.1", port, std::chrono::milliseconds(200));
     }
-    mock_server.close();
     server_thread.join();
+    mock_server.close();
 }

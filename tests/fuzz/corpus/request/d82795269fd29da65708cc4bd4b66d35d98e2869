@@ -1,0 +1,6 @@
+POST /su HTTP/1.1
+Host: ap/m
+-Type: applicatéon/json
+Content-Length: 18
+
+{"status":"ready"}

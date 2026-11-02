@@ -254,24 +254,57 @@ http::HttpResponse ReverseProxy::forward_to_backend(
 
         response_buf.append(buffer, static_cast<size_t>(bytes_read));
 
-        size_t consumed = 0;
-        http::ParseResult res = parser.parse_response(response_buf, backend_response, consumed, false, is_head);
-        if (res == http::ParseResult::Complete) {
-            return backend_response;
-        }
-        if (res == http::ParseResult::Error) {
-            backend->total_failures++;
-            LOG_ERROR("Malformed response received from backend: " << backend->address() << " - " << parser.get_error_message());
-            return http::HttpResponse::make_error(parser.get_error_status(), parser.get_error_message());
+        // Process response, handling interim 1xx informational responses (100 Continue, 102, 103)
+        while (!response_buf.empty()) {
+            size_t consumed = 0;
+            http::ParseResult res = parser.parse_response(response_buf, backend_response, consumed, false, is_head);
+            if (res == http::ParseResult::Complete) {
+                int code = static_cast<int>(backend_response.status_code);
+
+                // Handle 101 Switching Protocols
+                if (code == 101) {
+                    LOG_WARN("101 Switching Protocols received from backend but proxy upgrade tunneling is unsupported: " << backend->address());
+                    return http::HttpResponse::make_error(
+                        http::StatusCode::BadGateway,
+                        "101 Switching Protocols is unsupported by reverse proxy"
+                    );
+                }
+
+                // Handle interim informational responses (100 Continue, 102 Processing, 103 Early Hints)
+                if (code >= 100 && code < 200) {
+                    response_buf.erase(0, consumed);
+                    parser.reset();
+                    continue; // Re-check if final response is already present in buffer
+                }
+
+                // Final response (>= 200) received!
+                return backend_response;
+            } else if (res == http::ParseResult::Error) {
+                backend->total_failures++;
+                LOG_ERROR("Malformed response received from backend: " << backend->address() << " - " << parser.get_error_message());
+                return http::HttpResponse::make_error(parser.get_error_status(), parser.get_error_message());
+            } else {
+                // Incomplete: need more bytes from backend
+                break;
+            }
         }
     }
 
     // Only if genuine EOF occurred, attempt final parse for close-delimited response
     if (genuine_eof) {
-        size_t consumed = 0;
-        http::ParseResult res = parser.parse_response(response_buf, backend_response, consumed, true, is_head);
-        if (res == http::ParseResult::Complete) {
-            return backend_response;
+        while (!response_buf.empty()) {
+            size_t consumed = 0;
+            http::ParseResult res = parser.parse_response(response_buf, backend_response, consumed, true, is_head);
+            if (res == http::ParseResult::Complete) {
+                int code = static_cast<int>(backend_response.status_code);
+                if (code >= 100 && code < 200) {
+                    response_buf.erase(0, consumed);
+                    parser.reset();
+                    continue;
+                }
+                return backend_response;
+            }
+            break;
         }
     }
 

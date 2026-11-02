@@ -206,3 +206,83 @@ TEST(ReverseProxyTest, HandlesBackendDownReturnsBadGateway) {
     auto resp = proxy.handle_request(client_req, "127.0.0.1");
     EXPECT_EQ(resp.status_code, http::StatusCode::BadGateway);
 }
+
+TEST(ReverseProxyTest, HandlesInterim100ContinueResponse) {
+    net::ServerSocket mock_backend;
+    ASSERT_TRUE(mock_backend.bind_and_listen("127.0.0.1", 0));
+    uint16_t backend_port = mock_backend.get_bound_port();
+
+    std::thread backend_thread([&]() {
+        net::Socket client = mock_backend.accept();
+        ASSERT_TRUE(client.is_valid());
+
+        char buf[1024];
+        ssize_t bytes = client.receive(buf, sizeof(buf) - 1);
+        (void)bytes;
+
+        // First send 100 Continue, then 200 OK
+        std::string interim = "HTTP/1.1 100 Continue\r\n\r\n";
+        client.send_string(interim);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        std::string final_resp = "HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\nFinal Result";
+        client.send_string(final_resp);
+    });
+
+    auto node = std::make_shared<balancer::BackendServer>();
+    node->host = "127.0.0.1";
+    node->port = backend_port;
+
+    auto lb = std::make_shared<balancer::RoundRobinBalancer>(std::vector<std::shared_ptr<balancer::BackendServer>>{node});
+    config::ServerConfig cfg;
+    cfg.backend_timeout = std::chrono::milliseconds(2000);
+    proxy::ReverseProxy proxy(lb, cfg);
+
+    http::HttpRequest client_req;
+    client_req.method = http::Method::POST;
+    client_req.uri = "/upload";
+    client_req.path = "/upload";
+    client_req.body = "data";
+
+    auto resp = proxy.handle_request(client_req, "127.0.0.1");
+    backend_thread.join();
+
+    EXPECT_EQ(resp.status_code, http::StatusCode::OK);
+    EXPECT_EQ(resp.body, "Final Result");
+}
+
+TEST(ReverseProxyTest, Rejects101SwitchingProtocolsWithBadGateway) {
+    net::ServerSocket mock_backend;
+    ASSERT_TRUE(mock_backend.bind_and_listen("127.0.0.1", 0));
+    uint16_t backend_port = mock_backend.get_bound_port();
+
+    std::thread backend_thread([&]() {
+        net::Socket client = mock_backend.accept();
+        ASSERT_TRUE(client.is_valid());
+
+        char buf[1024];
+        ssize_t bytes = client.receive(buf, sizeof(buf) - 1);
+        (void)bytes;
+
+        std::string ws_resp = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+        client.send_string(ws_resp);
+    });
+
+    auto node = std::make_shared<balancer::BackendServer>();
+    node->host = "127.0.0.1";
+    node->port = backend_port;
+
+    auto lb = std::make_shared<balancer::RoundRobinBalancer>(std::vector<std::shared_ptr<balancer::BackendServer>>{node});
+    config::ServerConfig cfg;
+    cfg.backend_timeout = std::chrono::milliseconds(2000);
+    proxy::ReverseProxy proxy(lb, cfg);
+
+    http::HttpRequest client_req;
+    client_req.method = http::Method::GET;
+    client_req.uri = "/ws";
+    client_req.path = "/ws";
+
+    auto resp = proxy.handle_request(client_req, "127.0.0.1");
+    backend_thread.join();
+
+    EXPECT_EQ(resp.status_code, http::StatusCode::BadGateway);
+}

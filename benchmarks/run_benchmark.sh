@@ -87,58 +87,77 @@ for PORT in 9001 9002 9003; do
 done
 echo "[+] All 3 backend servers verified active and healthy."
 
-# Launch Load Balancer
-LB_CONFIG="$PROJECT_ROOT/config/config.example.json"
-"$BUILD_DIR/load_balancer_server" -c "$LB_CONFIG" > "$RESULTS_DIR/server.log" 2>&1 &
-LB_PID=$!
-echo "[+] Load Balancer launched (PID: $LB_PID) on port 8080"
-
 cleanup() {
     echo "[*] Cleaning up benchmark processes..."
     kill -SIGINT $LB_PID 2>/dev/null || true
     kill -9 $BACKEND_PID 2>/dev/null || true
-    rm -f "$MOCK_PID_FILE"
+    rm -f "$MOCK_PID_FILE" "$RESULTS_DIR/config_temp.json"
     echo "[+] Cleaned up successfully."
 }
 trap cleanup EXIT
 
-# Verify load balancer readiness
-LB_READY=0
-for i in {1..30}; do
-    if curl -s "http://127.0.0.1:8080/health" > /dev/null 2>&1; then
-        LB_READY=1
-        break
+for ALGO in round_robin least_connections; do
+    echo ""
+    echo "=========================================================="
+    echo " Benchmarking Algorithm: $ALGO"
+    echo "=========================================================="
+
+    # Create algorithm-specific configuration
+    sed 's/"algorithm": "[^"]*"/"algorithm": "'"$ALGO"'"/' "$PROJECT_ROOT/config/config.example.json" > "$RESULTS_DIR/config_temp.json"
+
+    # Launch Load Balancer
+    "$BUILD_DIR/load_balancer_server" -c "$RESULTS_DIR/config_temp.json" > "$RESULTS_DIR/server_${ALGO}.log" 2>&1 &
+    LB_PID=$!
+    echo "[+] Load Balancer ($ALGO) launched (PID: $LB_PID) on port 8080"
+
+    # Verify load balancer readiness
+    LB_READY=0
+    for i in {1..30}; do
+        if curl -s "http://127.0.0.1:8080/health" > /dev/null 2>&1; then
+            LB_READY=1
+            break
+        fi
+        sleep 0.1
+    done
+    if [ $LB_READY -ne 1 ]; then
+        echo "[!] Load balancer failed to start for $ALGO"
+        exit 1
     fi
-    sleep 0.1
-done
-if [ $LB_READY -ne 1 ]; then
-    echo "[!] Load balancer failed to start on port 8080"
-    exit 1
-fi
-echo "[+] Load balancer verified ready on http://127.0.0.1:8080"
+    echo "[+] Load balancer verified ready on http://127.0.0.1:8080"
 
-# 1. Warm-up on the actual proxy forwarding path
-echo "[*] Warming up reverse proxy forwarding path..."
-ab -n 500 -c 10 http://127.0.0.1:8080/api/bench > /dev/null 2>&1 || true
+    # Warm-up on proxy forwarding path
+    echo "[*] Warming up reverse proxy forwarding path ($ALGO)..."
+    ab -n 500 -c 10 http://127.0.0.1:8080/api/bench > /dev/null 2>&1 || true
 
-# 2. Benchmark Concurrency levels: 10, 50, 100
-for CONCURRENCY in 10 50 100; do
-    TOTAL_REQS=5000
-    OUTPUT_FILE="$RESULTS_DIR/ab_c${CONCURRENCY}.txt"
-    echo "[*] Running ApacheBench: Requests: $TOTAL_REQS, Concurrency: $CONCURRENCY..."
-    ab -n $TOTAL_REQS -c $CONCURRENCY http://127.0.0.1:8080/api/bench > "$OUTPUT_FILE" 2>&1
-    
-    # Extract Key Metrics
-    RPS=$(grep "Requests per second:" "$OUTPUT_FILE" | awk '{print $4}')
-    TIME_PER_REQ=$(grep "Time per request:" "$OUTPUT_FILE" | head -n 1 | awk '{print $4}')
-    FAILED_REQS=$(grep "Failed requests:" "$OUTPUT_FILE" | awk '{print $3}')
-    P95=$(grep "95%" "$OUTPUT_FILE" | awk '{print $2}')
-    P99=$(grep "99%" "$OUTPUT_FILE" | awk '{print $2}')
+    # Benchmark Concurrency levels: 10, 50, 100
+    for CONCURRENCY in 10 50 100; do
+        TOTAL_REQS=5000
+        OUTPUT_FILE="$RESULTS_DIR/ab_${ALGO}_c${CONCURRENCY}.txt"
+        echo "[*] Running ApacheBench: Algorithm: $ALGO, Requests: $TOTAL_REQS, Concurrency: $CONCURRENCY..."
+        ab -n $TOTAL_REQS -c $CONCURRENCY http://127.0.0.1:8080/api/bench > "$OUTPUT_FILE" 2>&1
+        
+        # Copy to default filename for round_robin backwards compatibility
+        if [ "$ALGO" = "round_robin" ]; then
+            cp "$OUTPUT_FILE" "$RESULTS_DIR/ab_c${CONCURRENCY}.txt"
+        fi
 
-    echo "    -> Throughput: $RPS req/sec"
-    echo "    -> Mean Latency: $TIME_PER_REQ ms"
-    echo "    -> P95 Latency: $P95 ms | P99 Latency: $P99 ms"
-    echo "    -> Failed Requests: $FAILED_REQS"
+        # Extract Key Metrics
+        RPS=$(grep "Requests per second:" "$OUTPUT_FILE" | awk '{print $4}')
+        TIME_PER_REQ=$(grep "Time per request:" "$OUTPUT_FILE" | head -n 1 | awk '{print $4}')
+        FAILED_REQS=$(grep "Failed requests:" "$OUTPUT_FILE" | awk '{print $3}')
+        P95=$(grep "95%" "$OUTPUT_FILE" | awk '{print $2}')
+        P99=$(grep "99%" "$OUTPUT_FILE" | awk '{print $2}')
+
+        echo "    -> Throughput: $RPS req/sec"
+        echo "    -> Mean Latency: $TIME_PER_REQ ms"
+        echo "    -> P95 Latency: $P95 ms | P99 Latency: $P99 ms"
+        echo "    -> Failed Requests: $FAILED_REQS"
+    done
+
+    # Gracefully stop the load balancer before switching algorithms
+    kill -SIGINT $LB_PID 2>/dev/null || true
+    wait $LB_PID 2>/dev/null || true
+    sleep 0.5
 done
 
 echo "=========================================================="

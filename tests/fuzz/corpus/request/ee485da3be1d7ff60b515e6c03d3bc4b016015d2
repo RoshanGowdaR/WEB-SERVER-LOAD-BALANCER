@@ -1,0 +1,6 @@
+POST /submit HTTP/1.1
+Host: ap/.excom
+Cont-Type: applicatéon/json
+Content-Length: 18
+
+{"status":"ready"}

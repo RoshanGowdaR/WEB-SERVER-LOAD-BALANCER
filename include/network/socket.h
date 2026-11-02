@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <optional>
 #include <vector>
+#include <atomic>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -29,8 +30,8 @@ public:
     Socket(Socket&& other) noexcept;
     Socket& operator=(Socket&& other) noexcept;
 
-    [[nodiscard]] int get_fd() const noexcept { return fd_; }
-    [[nodiscard]] bool is_valid() const noexcept { return fd_ >= 0; }
+    [[nodiscard]] int get_fd() const noexcept { return fd_.load(std::memory_order_acquire); }
+    [[nodiscard]] bool is_valid() const noexcept { return fd_.load(std::memory_order_acquire) >= 0; }
 
     void close() noexcept;
     void shutdown(int how = SHUT_RDWR) noexcept;
@@ -52,7 +53,7 @@ public:
     ssize_t receive_all(void* buffer, size_t length) noexcept;
 
 protected:
-    int fd_{-1};
+    std::atomic<int> fd_{-1};
 };
 
 /**

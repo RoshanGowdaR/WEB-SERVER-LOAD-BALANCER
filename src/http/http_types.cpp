@@ -29,6 +29,10 @@ Method string_to_method(std::string_view method_str) {
 
 std::string status_code_to_reason(StatusCode code) {
     switch (code) {
+        case StatusCode::Continue: return "Continue";
+        case StatusCode::SwitchingProtocols: return "Switching Protocols";
+        case StatusCode::Processing: return "Processing";
+        case StatusCode::EarlyHints: return "Early Hints";
         case StatusCode::OK: return "OK";
         case StatusCode::Created: return "Created";
         case StatusCode::Accepted: return "Accepted";

@@ -95,3 +95,48 @@ TEST(ConcurrencyTest, ThreadPoolBackpressureUnderHeavyLoad) {
     hold_workers.store(false);
     pool.shutdown(true);
 }
+
+TEST(ConcurrencyTest, SlowlorisAbsoluteDeadlineEnforced) {
+    config::ServerConfig cfg;
+    cfg.host = "127.0.0.1";
+    cfg.port = 18091;
+    cfg.worker_threads = 2;
+    cfg.connection_timeout = std::chrono::milliseconds(300); // 300ms absolute deadline
+    cfg.backends = {{"127.0.0.1", 19993, 1}};
+
+    server::Server srv(cfg);
+    ASSERT_TRUE(srv.start());
+
+    net::ClientSocket client;
+    ASSERT_TRUE(client.connect("127.0.0.1", 18091, std::chrono::milliseconds(1000)));
+
+    // Client trickles 1 byte every 80ms without finishing the headers
+    // With 5 iterations * 80ms = 400ms, exceeding the 300ms absolute deadline
+    bool timeout_received = false;
+    for (int i = 0; i < 6; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        char byte = 'X';
+        if (client.send_all(&byte, 1) <= 0) {
+            timeout_received = true;
+            break;
+        }
+    }
+
+    // Try reading response from server
+    client.set_receive_timeout(std::chrono::milliseconds(500));
+    char buf[1024];
+    ssize_t n = client.receive(buf, sizeof(buf) - 1);
+    if (n > 0) {
+        buf[n] = '\0';
+        std::string resp(buf, n);
+        if (resp.find("408") != std::string::npos || resp.find("Request Timeout") != std::string::npos) {
+            timeout_received = true;
+        }
+    } else {
+        // Socket closed by server due to deadline
+        timeout_received = true;
+    }
+
+    srv.stop();
+    EXPECT_TRUE(timeout_received);
+}

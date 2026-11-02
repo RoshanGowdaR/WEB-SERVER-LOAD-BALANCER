@@ -234,3 +234,42 @@ TEST(HttpParserTest, RejectBackendResponseOversizedBody) {
     EXPECT_EQ(parser.parse_response(raw, resp, consumed), http::ParseResult::Error);
     EXPECT_EQ(parser.get_error_status(), http::StatusCode::BadGateway);
 }
+
+TEST(HttpParserTest, ParseBackendResponseInformational1xx) {
+    http::HttpParser parser;
+    // 100 Continue
+    std::string raw100 = "HTTP/1.1 100 Continue\r\n\r\n";
+    http::HttpResponse resp100;
+    size_t consumed = 0;
+    EXPECT_EQ(parser.parse_response(raw100, resp100, consumed), http::ParseResult::Complete);
+    EXPECT_EQ(resp100.status_code, http::StatusCode::Continue);
+    EXPECT_EQ(consumed, raw100.size());
+    EXPECT_TRUE(resp100.body.empty());
+
+    // 103 Early Hints
+    std::string raw103 = "HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n";
+    http::HttpResponse resp103;
+    consumed = 0;
+    EXPECT_EQ(parser.parse_response(raw103, resp103, consumed), http::ParseResult::Complete);
+    EXPECT_EQ(resp103.status_code, http::StatusCode::EarlyHints);
+    EXPECT_EQ(consumed, raw103.size());
+    EXPECT_TRUE(resp103.body.empty());
+}
+
+TEST(HttpParserTest, RejectBackendChunkedTransferEncoding) {
+    http::HttpParser parser;
+    std::string raw = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+    http::HttpResponse resp;
+    size_t consumed = 0;
+    EXPECT_EQ(parser.parse_response(raw, resp, consumed), http::ParseResult::Error);
+    EXPECT_EQ(parser.get_error_status(), http::StatusCode::BadGateway);
+}
+
+TEST(HttpParserTest, RejectBackendUnsupportedTransferEncoding) {
+    http::HttpParser parser;
+    std::string raw = "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n";
+    http::HttpResponse resp;
+    size_t consumed = 0;
+    EXPECT_EQ(parser.parse_response(raw, resp, consumed), http::ParseResult::Error);
+    EXPECT_EQ(parser.get_error_status(), http::StatusCode::BadGateway);
+}

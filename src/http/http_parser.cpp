@@ -423,20 +423,23 @@ ParseResult HttpParser::parse_response(
         line_delim = 1;
     }
 
+    std::string_view status_line;
+    std::string_view headers_block;
     if (line_end == std::string_view::npos) {
-        error_status_ = StatusCode::BadGateway;
-        error_message_ = "Malformed backend response: missing status line delimiter.";
-        return ParseResult::Error;
+        // No headers present, entire header_section is the status line (e.g. HTTP/1.1 100 Continue\r\n\r\n)
+        status_line = header_section;
+        headers_block = {};
+    } else {
+        status_line = header_section.substr(0, line_end);
+        headers_block = header_section.substr(line_end + line_delim);
     }
 
-    std::string_view status_line = header_section.substr(0, line_end);
     if (!parse_status_line(status_line, out_response)) {
         return ParseResult::Error;
     }
 
-    std::string_view headers_block = header_section.substr(line_end + line_delim);
     out_response.headers.clear();
-    if (!parse_headers(headers_block, out_response.headers, true)) {
+    if (!headers_block.empty() && !parse_headers(headers_block, out_response.headers, true)) {
         return ParseResult::Error;
     }
 
@@ -460,6 +463,15 @@ ParseResult HttpParser::parse_response(
         error_status_ = StatusCode::BadGateway;
         error_message_ = "Conflicting framing headers in backend response (Transfer-Encoding and Content-Length).";
         return ParseResult::Error;
+    }
+
+    if (has_te) {
+        auto te = out_response.get_header("Transfer-Encoding").value_or("");
+        if (!te.empty() && te != "identity") {
+            error_status_ = StatusCode::BadGateway;
+            error_message_ = "Chunked or unsupported Transfer-Encoding from backend is not supported; Content-Length framing required.";
+            return ParseResult::Error;
+        }
     }
 
     size_t content_length = 0;
