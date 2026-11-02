@@ -2,16 +2,17 @@ name: CI / Build & Test
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, developer ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, developer ]
 
 jobs:
   build-and-test:
+    name: GCC Release Build & Tests
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2
 
       - name: Install dependencies
         run: |
@@ -26,19 +27,20 @@ jobs:
         run: |
           cmake --build build -j$(nproc)
 
-      - name: Run Test Suite (CTest)
+      - name: Run Complete Test Suite (CTest)
         run: |
           cd build && ctest --output-on-failure
 
-      - name: Run Automated E2E Validation
+      - name: Run Automated E2E System Validation
         run: |
           python3 scripts/e2e_test.py
 
-  sanitizers:
+  asan-ubsan:
+    name: Address & UndefinedBehavior Sanitizers
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2
 
       - name: Install dependencies
         run: |
@@ -53,6 +55,30 @@ jobs:
         run: |
           cmake --build build-asan -j$(nproc)
 
-      - name: Run Tests with Sanitizers
+      - name: Run Tests under ASan & UBSan
         run: |
           cd build-asan && ctest --output-on-failure
+
+  tsan:
+    name: ThreadSanitizer (TSan) Concurrency Audit
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4.2.2
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y build-essential cmake git libgtest-dev
+
+      - name: Configure TSan
+        run: |
+          cmake -B build-tsan -S . -DENABLE_TSAN=ON -DBUILD_TESTING=ON
+
+      - name: Build with TSan
+        run: |
+          cmake --build build-tsan -j$(nproc)
+
+      - name: Run Tests under TSan
+        run: |
+          cd build-tsan && ctest --output-on-failure

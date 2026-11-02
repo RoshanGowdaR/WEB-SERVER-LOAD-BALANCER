@@ -2,6 +2,7 @@
 #include <sstream>
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 
 namespace http {
 
@@ -42,10 +43,10 @@ void HttpRequest::append_header_value(const std::string& key, const std::string&
 size_t HttpRequest::content_length() const noexcept {
     auto cl = get_header("Content-Length");
     if (cl) {
-        try {
-            return std::stoul(*cl);
-        } catch (...) {
-            return 0;
+        size_t val = 0;
+        auto [ptr, ec] = std::from_chars(cl->data(), cl->data() + cl->size(), val);
+        if (ec == std::errc{} && ptr == cl->data() + cl->size()) {
+            return val;
         }
     }
     return 0;

@@ -68,7 +68,7 @@ TEST(HttpParserTest, IncrementalStreamingParse) {
 TEST(HttpParserTest, RejectOversizedHeaders) {
     http::HttpParser parser(256, 1024); // Low 256 bytes header limit
     std::string large_header(300, 'X');
-    std::string raw = "GET /test HTTP/1.1\r\nX-Large-Header: " + large_header + "\r\n\r\n";
+    std::string raw = "GET /test HTTP/1.1\r\nHost: localhost\r\nX-Large-Header: " + large_header + "\r\n\r\n";
 
     http::HttpRequest req;
     size_t consumed = 0;
@@ -98,12 +98,93 @@ TEST(HttpParserTest, RejectMalformedRequestLine) {
     EXPECT_EQ(parser.get_error_status(), http::StatusCode::BadRequest);
 }
 
-TEST(HttpParserTest, RejectConflictingContentLength) {
+TEST(HttpParserTest, RejectHttp11WithoutHostHeader) {
+    http::HttpParser parser;
+    std::string raw = "GET /index.html HTTP/1.1\r\nUser-Agent: test\r\n\r\n";
+
+    http::HttpRequest req;
+    size_t consumed = 0;
+    EXPECT_EQ(parser.parse_request(raw, req, consumed), http::ParseResult::Error);
+    EXPECT_EQ(parser.get_error_status(), http::StatusCode::BadRequest);
+    EXPECT_NE(parser.get_error_message().find("Host"), std::string::npos);
+}
+
+TEST(HttpParserTest, RejectMultipleHostHeaders) {
+    http::HttpParser parser;
+    std::string raw = "GET /index.html HTTP/1.1\r\n"
+                      "Host: example.com\r\n"
+                      "Host: attacker.com\r\n\r\n";
+
+    http::HttpRequest req;
+    size_t consumed = 0;
+    EXPECT_EQ(parser.parse_request(raw, req, consumed), http::ParseResult::Error);
+    EXPECT_EQ(parser.get_error_status(), http::StatusCode::BadRequest);
+}
+
+TEST(HttpParserTest, RejectInvalidContentLengthFormats) {
+    http::HttpParser parser;
+    http::HttpRequest req;
+    size_t consumed = 0;
+
+    // Signed positive
+    std::string raw1 = "POST /test HTTP/1.1\r\nHost: local\r\nContent-Length: +5\r\n\r\nhello";
+    EXPECT_EQ(parser.parse_request(raw1, req, consumed), http::ParseResult::Error);
+    EXPECT_EQ(parser.get_error_status(), http::StatusCode::BadRequest);
+
+    // Negative
+    std::string raw2 = "POST /test HTTP/1.1\r\nHost: local\r\nContent-Length: -5\r\n\r\nhello";
+    parser.reset();
+    EXPECT_EQ(parser.parse_request(raw2, req, consumed), http::ParseResult::Error);
+    EXPECT_EQ(parser.get_error_status(), http::StatusCode::BadRequest);
+
+    // Non-numeric trailing characters
+    std::string raw3 = "POST /test HTTP/1.1\r\nHost: local\r\nContent-Length: 5abc\r\n\r\nhello";
+    parser.reset();
+    EXPECT_EQ(parser.parse_request(raw3, req, consumed), http::ParseResult::Error);
+    EXPECT_EQ(parser.get_error_status(), http::StatusCode::BadRequest);
+}
+
+TEST(HttpParserTest, RejectConflictingContentLengthAndTransferEncoding) {
+    http::HttpParser parser;
+    std::string raw = "POST /smuggle HTTP/1.1\r\n"
+                      "Host: test\r\n"
+                      "Transfer-Encoding: chunked\r\n"
+                      "Content-Length: 20\r\n\r\n";
+
+    http::HttpRequest req;
+    size_t consumed = 0;
+    EXPECT_EQ(parser.parse_request(raw, req, consumed), http::ParseResult::Error);
+    EXPECT_EQ(parser.get_error_status(), http::StatusCode::BadRequest);
+}
+
+TEST(HttpParserTest, RejectDuplicateContentLengthEvenIfIdentical) {
     http::HttpParser parser;
     std::string raw = "POST /submit HTTP/1.1\r\n"
                       "Host: test\r\n"
                       "Content-Length: 20\r\n"
-                      "Content-Length: 40\r\n\r\n";
+                      "Content-Length: 20\r\n\r\n";
+
+    http::HttpRequest req;
+    size_t consumed = 0;
+    EXPECT_EQ(parser.parse_request(raw, req, consumed), http::ParseResult::Error);
+    EXPECT_EQ(parser.get_error_status(), http::StatusCode::BadRequest);
+}
+
+TEST(HttpParserTest, RejectInvalidHeaderFieldNames) {
+    http::HttpParser parser;
+    // Header name with illegal space
+    std::string raw = "GET /test HTTP/1.1\r\nHost: local\r\nBad Header: value\r\n\r\n";
+
+    http::HttpRequest req;
+    size_t consumed = 0;
+    EXPECT_EQ(parser.parse_request(raw, req, consumed), http::ParseResult::Error);
+    EXPECT_EQ(parser.get_error_status(), http::StatusCode::BadRequest);
+}
+
+TEST(HttpParserTest, RejectCrlfInjectionInHeaderValue) {
+    http::HttpParser parser;
+    // Value with embedded CR
+    std::string raw = "GET /test HTTP/1.1\r\nHost: local\r\nX-Injected: line1\rline2\r\n\r\n";
 
     http::HttpRequest req;
     size_t consumed = 0;
@@ -124,4 +205,32 @@ TEST(HttpParserTest, ParseBackendResponse) {
     EXPECT_EQ(parser.parse_response(raw, resp, consumed), http::ParseResult::Complete);
     EXPECT_EQ(resp.status_code, http::StatusCode::OK);
     EXPECT_EQ(resp.body, body);
+}
+
+TEST(HttpParserTest, ParseBackendResponseSpecialStatusCodesWithoutBody) {
+    http::HttpParser parser;
+    // 204 No Content
+    std::string raw204 = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
+    http::HttpResponse resp204;
+    size_t consumed = 0;
+    EXPECT_EQ(parser.parse_response(raw204, resp204, consumed), http::ParseResult::Complete);
+    EXPECT_EQ(resp204.status_code, http::StatusCode::NoContent);
+    EXPECT_TRUE(resp204.body.empty());
+
+    // 304 Not Modified
+    std::string raw304 = "HTTP/1.1 304 Not Modified\r\nETag: \"abc\"\r\n\r\n";
+    http::HttpResponse resp304;
+    consumed = 0;
+    EXPECT_EQ(parser.parse_response(raw304, resp304, consumed), http::ParseResult::Complete);
+    EXPECT_EQ(resp304.status_code, http::StatusCode::NotModified);
+    EXPECT_TRUE(resp304.body.empty());
+}
+
+TEST(HttpParserTest, RejectBackendResponseOversizedBody) {
+    http::HttpParser parser(4096, 50); // max 50 bytes body
+    std::string raw = "HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n" + std::string(1000, 'X');
+    http::HttpResponse resp;
+    size_t consumed = 0;
+    EXPECT_EQ(parser.parse_response(raw, resp, consumed), http::ParseResult::Error);
+    EXPECT_EQ(parser.get_error_status(), http::StatusCode::BadGateway);
 }

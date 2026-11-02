@@ -12,7 +12,7 @@ namespace balancer {
 
 struct BackendServer {
     std::string host;
-    uint16_t port;
+    uint16_t port{0};
     int weight{1};
 
     std::atomic<bool> is_healthy{true};
@@ -38,20 +38,22 @@ public:
     [[nodiscard]] virtual std::string get_name() const = 0;
 };
 
-// RAII helper to increment and decrement active connections on a backend
+// RAII helper to increment and decrement active connections on a backend with underflow protection
 class BackendConnectionGuard {
 public:
     explicit BackendConnectionGuard(std::shared_ptr<BackendServer> backend)
         : backend_(std::move(backend)) {
         if (backend_) {
-            backend_->active_connections++;
-            backend_->total_requests++;
+            backend_->active_connections.fetch_add(1, std::memory_order_relaxed);
+            backend_->total_requests.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
     ~BackendConnectionGuard() {
         if (backend_) {
-            backend_->active_connections--;
+            uint32_t cur = backend_->active_connections.load(std::memory_order_relaxed);
+            while (cur > 0 && !backend_->active_connections.compare_exchange_weak(
+                   cur, cur - 1, std::memory_order_relaxed)) {}
         }
     }
 

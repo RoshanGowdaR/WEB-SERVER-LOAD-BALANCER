@@ -8,6 +8,8 @@
 #include "server/tcp_server.h"
 #include <memory>
 #include <atomic>
+#include <mutex>
+#include <condition_variable>
 
 namespace server {
 
@@ -36,6 +38,9 @@ private:
     std::unique_ptr<TcpServer> tcp_server_;
 
     std::atomic<bool> is_running_{false};
+    std::atomic<bool> is_stopped_{false};
+    std::mutex shutdown_mutex_;
+    std::condition_variable cv_shutdown_;
 };
 
 } // namespace server

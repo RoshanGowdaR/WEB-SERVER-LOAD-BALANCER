@@ -29,6 +29,7 @@ endif()
 option(ENABLE_ASAN "Enable Address & Undefined Behavior Sanitizers" OFF)
 option(ENABLE_TSAN "Enable Thread Sanitizer" OFF)
 option(ENABLE_FUZZING "Enable Fuzz Testing target" OFF)
+option(ENABLE_LIBFUZZER "Enable LLVM libFuzzer targets (requires Clang)" OFF)
 
 if(ENABLE_ASAN AND ENABLE_TSAN)
     message(FATAL_ERROR "ASan and TSan cannot be enabled simultaneously.")

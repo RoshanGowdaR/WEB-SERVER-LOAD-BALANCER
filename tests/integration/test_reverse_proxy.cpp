@@ -85,6 +85,109 @@ TEST(ReverseProxyTest, ForwardsRequestToMockBackend) {
     EXPECT_EQ(resp.body, "Hello Backend");
 }
 
+TEST(ReverseProxyTest, StripsHopByHopAndConnectionNominatedHeaders) {
+    net::ServerSocket mock_backend;
+    ASSERT_TRUE(mock_backend.bind_and_listen("127.0.0.1", 0));
+    uint16_t backend_port = mock_backend.get_bound_port();
+
+    std::string received_raw_request;
+
+    std::thread backend_thread([&]() {
+        net::Socket client = mock_backend.accept();
+        ASSERT_TRUE(client.is_valid());
+
+        char buf[4096];
+        ssize_t bytes = client.receive(buf, sizeof(buf) - 1);
+        if (bytes > 0) {
+            buf[bytes] = '\0';
+            received_raw_request = std::string(buf, bytes);
+        }
+
+        std::string reply = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+        client.send_string(reply);
+    });
+
+    auto node = std::make_shared<balancer::BackendServer>();
+    node->host = "127.0.0.1";
+    node->port = backend_port;
+
+    auto lb = std::make_shared<balancer::RoundRobinBalancer>(std::vector<std::shared_ptr<balancer::BackendServer>>{node});
+    config::ServerConfig cfg;
+    cfg.backend_timeout = std::chrono::milliseconds(2000);
+    proxy::ReverseProxy proxy(lb, cfg);
+
+    http::HttpRequest client_req;
+    client_req.method = http::Method::GET;
+    client_req.uri = "/hopbyhop";
+    client_req.path = "/hopbyhop";
+    client_req.set_header("Connection", "Keep-Alive, X-Nominated-Custom");
+    client_req.set_header("Keep-Alive", "timeout=5, max=1000");
+    client_req.set_header("Proxy-Authorization", "Basic dXNlcjpwYXNz");
+    client_req.set_header("Upgrade", "websocket");
+    client_req.set_header("X-Nominated-Custom", "strip-me");
+    client_req.set_header("X-Regular-Header", "preserve-me");
+
+    auto resp = proxy.handle_request(client_req, "10.0.0.1");
+    backend_thread.join();
+
+    EXPECT_EQ(resp.status_code, http::StatusCode::OK);
+    // Hop-by-hop headers must NOT reach the backend
+    EXPECT_EQ(received_raw_request.find("Keep-Alive:"), std::string::npos);
+    EXPECT_EQ(received_raw_request.find("Proxy-Authorization:"), std::string::npos);
+    EXPECT_EQ(received_raw_request.find("Upgrade:"), std::string::npos);
+    EXPECT_EQ(received_raw_request.find("X-Nominated-Custom:"), std::string::npos);
+    // Regular headers must be preserved
+    EXPECT_NE(received_raw_request.find("X-Regular-Header: preserve-me"), std::string::npos);
+}
+
+TEST(ReverseProxyTest, ReplacesClientSuppliedXForwardedForToPreventSpoofing) {
+    net::ServerSocket mock_backend;
+    ASSERT_TRUE(mock_backend.bind_and_listen("127.0.0.1", 0));
+    uint16_t backend_port = mock_backend.get_bound_port();
+
+    std::string received_raw_request;
+
+    std::thread backend_thread([&]() {
+        net::Socket client = mock_backend.accept();
+        ASSERT_TRUE(client.is_valid());
+
+        char buf[4096];
+        ssize_t bytes = client.receive(buf, sizeof(buf) - 1);
+        if (bytes > 0) {
+            buf[bytes] = '\0';
+            received_raw_request = std::string(buf, bytes);
+        }
+
+        std::string reply = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+        client.send_string(reply);
+    });
+
+    auto node = std::make_shared<balancer::BackendServer>();
+    node->host = "127.0.0.1";
+    node->port = backend_port;
+
+    auto lb = std::make_shared<balancer::RoundRobinBalancer>(std::vector<std::shared_ptr<balancer::BackendServer>>{node});
+    config::ServerConfig cfg;
+    cfg.backend_timeout = std::chrono::milliseconds(2000);
+    proxy::ReverseProxy proxy(lb, cfg);
+
+    http::HttpRequest client_req;
+    client_req.method = http::Method::GET;
+    client_req.uri = "/spoof";
+    client_req.path = "/spoof";
+    // Client tries to spoof its IP as 8.8.8.8
+    client_req.set_header("X-Forwarded-For", "8.8.8.8");
+
+    // Real client IP is 172.16.0.4
+    auto resp = proxy.handle_request(client_req, "172.16.0.4");
+    backend_thread.join();
+
+    EXPECT_EQ(resp.status_code, http::StatusCode::OK);
+    // The forwarded request must have 172.16.0.4, NOT 8.8.8.8
+    EXPECT_EQ(received_raw_request.find("8.8.8.8"), std::string::npos);
+    EXPECT_NE(received_raw_request.find("X-Forwarded-For: 172.16.0.4"), std::string::npos);
+}
+
 TEST(ReverseProxyTest, HandlesBackendDownReturnsBadGateway) {
     auto node = std::make_shared<balancer::BackendServer>();
     node->host = "127.0.0.1";

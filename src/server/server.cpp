@@ -52,6 +52,7 @@ Server::~Server() {
 
 bool Server::start() {
     if (is_running_.exchange(true)) return true;
+    is_stopped_.store(false);
 
     LOG_INFO("Starting High-Performance Load Balancer Server...");
     health_checker_->start();
@@ -67,28 +68,41 @@ bool Server::start() {
 }
 
 void Server::stop() {
-    if (!is_running_.exchange(false)) return;
+    if (!is_running_.exchange(false)) {
+        return;
+    }
 
     LOG_INFO("Initiating graceful shutdown sequence...");
+
+    // 1. Stop accepting new connections
     if (tcp_server_) {
         tcp_server_->stop();
     }
 
+    // 2. Stop health monitoring
     if (health_checker_) {
         health_checker_->stop();
     }
 
+    // 3. Gracefully drain task queue and join workers
     if (thread_pool_) {
         thread_pool_->shutdown(true);
     }
+
+    {
+        std::lock_guard<std::mutex> lock(shutdown_mutex_);
+        is_stopped_.store(true);
+    }
+    cv_shutdown_.notify_all();
 
     LOG_INFO("Shutdown sequence finished.");
 }
 
 void Server::wait() {
-    while (is_running_.load()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    }
+    std::unique_lock<std::mutex> lock(shutdown_mutex_);
+    cv_shutdown_.wait(lock, [this]() {
+        return !is_running_.load() && is_stopped_.load();
+    });
 }
 
 } // namespace server

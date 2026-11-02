@@ -72,6 +72,11 @@ void TcpServer::accept_loop() {
             continue;
         }
 
+        // Apply connection deadlines immediately to mitigate Slowloris resource exhaustion
+        client_sock.set_receive_timeout(config_.connection_timeout);
+        client_sock.set_send_timeout(config_.connection_timeout);
+        client_sock.set_tcp_nodelay(true);
+
         // Delegate client handling to thread pool
         if (thread_pool_) {
             auto sock_ptr = std::make_shared<net::Socket>(std::move(client_sock));
@@ -110,11 +115,22 @@ void TcpServer::handle_client(net::Socket client_sock, std::string client_ip, ui
     http::HttpParser parser(config_.max_header_size, config_.max_body_size);
     std::string read_buffer;
     char buffer[4096];
+    const size_t max_total_allowed = config_.max_header_size + config_.max_body_size;
 
     while (running_.load()) {
         ssize_t bytes = client_sock.receive(buffer, sizeof(buffer));
         if (bytes <= 0) {
-            // Client closed connection or timeout reached
+            // Client closed connection or receive timed out
+            break;
+        }
+
+        if (read_buffer.size() + static_cast<size_t>(bytes) > max_total_allowed) {
+            http::HttpResponse err_resp = http::HttpResponse::make_error(
+                http::StatusCode::PayloadTooLarge,
+                "Request payload exceeds configured limit"
+            );
+            std::string s = err_resp.to_string();
+            client_sock.send_all(s.data(), s.size());
             break;
         }
 
