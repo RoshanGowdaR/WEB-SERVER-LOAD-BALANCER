@@ -11,6 +11,8 @@ services:
       - backend-1
       - backend-2
       - backend-3
+    volumes:
+      - ./config/config.docker.json:/app/config.json:ro
     environment:
       - ENVIRONMENT=production
     restart: unless-stopped

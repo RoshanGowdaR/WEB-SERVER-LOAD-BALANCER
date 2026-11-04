@@ -21,6 +21,7 @@ public:
     [[nodiscard]] bool has_header(const std::string& key) const noexcept;
     [[nodiscard]] std::optional<std::string> get_header(const std::string& key) const noexcept;
     void set_header(std::string key, std::string value);
+    void remove_header(const std::string& key);
 
     [[nodiscard]] size_t content_length() const noexcept;
     [[nodiscard]] bool is_keep_alive() const noexcept;

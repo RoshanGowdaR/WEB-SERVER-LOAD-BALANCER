@@ -5,6 +5,27 @@
 
 namespace monitoring {
 
+namespace {
+
+std::string escape_prometheus_label(std::string_view val) {
+    std::string out;
+    out.reserve(val.size() + 4);
+    for (char c : val) {
+        if (c == '\\') {
+            out += "\\\\";
+        } else if (c == '"') {
+            out += "\\\"";
+        } else if (c == '\n') {
+            out += "\\n";
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
+} // namespace
+
 Metrics& Metrics::instance() {
     static Metrics inst;
     return inst;
@@ -120,7 +141,7 @@ std::string Metrics::to_prometheus_format(const std::vector<std::shared_ptr<bala
        << "# TYPE loadbalancer_backend_healthy gauge\n";
     for (const auto& b : backends) {
         if (!b) continue;
-        ss << "loadbalancer_backend_healthy{backend=\"" << b->address() << "\"} "
+        ss << "loadbalancer_backend_healthy{backend=\"" << escape_prometheus_label(b->address()) << "\"} "
            << (b->is_healthy.load() ? 1 : 0) << "\n";
     }
     ss << "\n";
@@ -129,7 +150,7 @@ std::string Metrics::to_prometheus_format(const std::vector<std::shared_ptr<bala
        << "# TYPE loadbalancer_backend_active_connections gauge\n";
     for (const auto& b : backends) {
         if (!b) continue;
-        ss << "loadbalancer_backend_active_connections{backend=\"" << b->address() << "\"} "
+        ss << "loadbalancer_backend_active_connections{backend=\"" << escape_prometheus_label(b->address()) << "\"} "
            << b->active_connections.load() << "\n";
     }
     ss << "\n";
@@ -138,7 +159,7 @@ std::string Metrics::to_prometheus_format(const std::vector<std::shared_ptr<bala
        << "# TYPE loadbalancer_backend_requests_total counter\n";
     for (const auto& b : backends) {
         if (!b) continue;
-        ss << "loadbalancer_backend_requests_total{backend=\"" << b->address() << "\"} "
+        ss << "loadbalancer_backend_requests_total{backend=\"" << escape_prometheus_label(b->address()) << "\"} "
            << b->total_requests.load() << "\n";
     }
     ss << "\n";
@@ -171,8 +192,8 @@ std::string Metrics::to_backends_json(const std::vector<std::shared_ptr<balancer
         const auto& b = backends[i];
         if (!b) continue;
         ss << "  {\n"
-           << "    \"address\": \"" << b->address() << "\",\n"
-           << "    \"host\": \"" << b->host << "\",\n"
+           << "    \"address\": \"" << escape_prometheus_label(b->address()) << "\",\n"
+           << "    \"host\": \"" << escape_prometheus_label(b->host) << "\",\n"
            << "    \"port\": " << b->port << ",\n"
            << "    \"healthy\": " << (b->is_healthy.load() ? "true" : "false") << ",\n"
            << "    \"active_connections\": " << b->active_connections.load() << ",\n"

@@ -1,6 +1,7 @@
 #include "http/response.h"
 #include <sstream>
 #include <algorithm>
+#include <charconv>
 
 namespace http {
 
@@ -23,13 +24,17 @@ void HttpResponse::set_header(std::string key, std::string value) {
     headers[std::move(key)] = std::move(value);
 }
 
+void HttpResponse::remove_header(const std::string& key) {
+    headers.erase(key);
+}
+
 size_t HttpResponse::content_length() const noexcept {
     auto cl = get_header("Content-Length");
     if (cl) {
-        try {
-            return std::stoul(*cl);
-        } catch (...) {
-            return body.size();
+        size_t val = 0;
+        auto [ptr, ec] = std::from_chars(cl->data(), cl->data() + cl->size(), val);
+        if (ec == std::errc{} && ptr == cl->data() + cl->size()) {
+            return val;
         }
     }
     return body.size();
@@ -53,7 +58,10 @@ std::string HttpResponse::to_string() const {
 
     bool has_content_length = false;
     for (const auto& [k, v] : headers) {
-        if (k == "Content-Length" || k == "content-length") {
+        std::string lower = k;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (lower == "content-length") {
             has_content_length = true;
         }
         oss << k << ": " << v << "\r\n";

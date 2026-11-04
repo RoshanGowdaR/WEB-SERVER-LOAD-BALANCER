@@ -28,23 +28,38 @@ ThreadPool::~ThreadPool() {
 void ThreadPool::shutdown(bool wait_for_all_tasks) {
     {
         std::unique_lock<std::mutex> lock(queue_mutex_);
-        if (stop_.load()) return;
-        stop_.store(true);
+        if (stop_.load()) {
+            // Already shutting down. If previously requested graceful but now immediate requested:
+            if (!wait_for_all_tasks && drain_queue_.load()) {
+                drain_queue_.store(false);
+                while (!tasks_.empty()) {
+                    tasks_.pop();
+                }
+                cv_task_available_.notify_all();
+                cv_space_available_.notify_all();
+            }
+        } else {
+            stop_.store(true);
+            drain_queue_.store(wait_for_all_tasks);
+            if (!wait_for_all_tasks) {
+                // Immediate shutdown: discard all pending unstarted tasks
+                while (!tasks_.empty()) {
+                    tasks_.pop();
+                }
+            }
+        }
     }
 
     cv_task_available_.notify_all();
     cv_space_available_.notify_all();
 
-    for (std::thread& worker : workers_) {
-        if (worker.joinable()) {
-            worker.join();
-        }
-    }
-
-    if (!wait_for_all_tasks) {
-        std::unique_lock<std::mutex> lock(queue_mutex_);
-        while (!tasks_.empty()) {
-            tasks_.pop();
+    // Idempotently join all worker threads
+    bool expected_joined = false;
+    if (is_joined_.compare_exchange_strong(expected_joined, true)) {
+        for (std::thread& worker : workers_) {
+            if (worker.joinable()) {
+                worker.join();
+            }
         }
     }
 }
@@ -92,11 +107,22 @@ void ThreadPool::worker_loop() {
         {
             std::unique_lock<std::mutex> lock(queue_mutex_);
             cv_task_available_.wait(lock, [this]() {
+                if (!drain_queue_.load() && stop_.load()) {
+                    return true;
+                }
                 return stop_.load() || !tasks_.empty();
             });
 
+            // If immediate shutdown requested or (graceful shutdown and queue is empty)
+            if (!drain_queue_.load() && stop_.load() && tasks_.empty()) {
+                return;
+            }
             if (stop_.load() && tasks_.empty()) {
                 return;
+            }
+
+            if (tasks_.empty()) {
+                continue;
             }
 
             task = std::move(tasks_.front());

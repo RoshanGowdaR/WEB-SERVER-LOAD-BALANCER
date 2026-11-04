@@ -4,6 +4,7 @@
 #include "logging/logger.h"
 #include <csignal>
 #include <poll.h>
+#include <chrono>
 
 namespace server {
 
@@ -40,11 +41,20 @@ void TcpServer::stop() {
     if (!running_.exchange(false)) return;
 
     LOG_INFO("Stopping TcpServer...");
-    listening_socket_.close();
 
+    // 1. Wake up accept thread cleanly via loopback connection without closing socket out from under it
+    if (listening_socket_.is_valid()) {
+        net::ClientSocket wake_sock;
+        wake_sock.connect(config_.host, config_.port, std::chrono::milliseconds(50));
+    }
+
+    // 2. Wait for accept thread to completely exit before closing the descriptor
     if (accept_thread_.joinable()) {
         accept_thread_.join();
     }
+
+    // 3. Close listening socket descriptor only after accept thread is joined
+    listening_socket_.close();
     LOG_INFO("TcpServer stopped.");
 }
 
@@ -54,7 +64,10 @@ void TcpServer::accept_loop() {
         pfd.fd = listening_socket_.get_fd();
         pfd.events = POLLIN;
 
-        int poll_res = ::poll(&pfd, 1, 500); // 500ms timeout for clean cancellation
+        int poll_res = ::poll(&pfd, 1, 200); // 200ms timeout for clean cancellation
+        if (!running_.load()) {
+            break;
+        }
         if (poll_res < 0) {
             if (errno == EINTR) continue;
             break;
@@ -67,10 +80,23 @@ void TcpServer::accept_loop() {
         uint16_t client_port = 0;
         net::Socket client_sock = listening_socket_.accept(&client_ip, &client_port);
 
+        if (!running_.load()) {
+            break;
+        }
+
+        if (!client_sock.is_valid()) {
+            continue;
+        }
+
         if (!client_sock.is_valid()) {
             if (!running_.load()) break;
             continue;
         }
+
+        // Apply connection deadlines immediately to mitigate Slowloris resource exhaustion
+        client_sock.set_receive_timeout(config_.connection_timeout);
+        client_sock.set_send_timeout(config_.connection_timeout);
+        client_sock.set_tcp_nodelay(true);
 
         // Delegate client handling to thread pool
         if (thread_pool_) {
@@ -110,11 +136,42 @@ void TcpServer::handle_client(net::Socket client_sock, std::string client_ip, ui
     http::HttpParser parser(config_.max_header_size, config_.max_body_size);
     std::string read_buffer;
     char buffer[4096];
+    const size_t max_total_allowed = config_.max_header_size + config_.max_body_size;
+
+    // Monotonic clock absolute deadline to prevent Slowloris slow-trickle attacks
+    auto request_start = std::chrono::steady_clock::now();
+    auto request_deadline = request_start + config_.connection_timeout;
 
     while (running_.load()) {
+        auto now = std::chrono::steady_clock::now();
+        if (now >= request_deadline) {
+            http::HttpResponse timeout_resp = http::HttpResponse::make_error(
+                http::StatusCode::RequestTimeout,
+                "Request timeout: client did not complete request within deadline"
+            );
+            timeout_resp.set_header("Connection", "close");
+            std::string s = timeout_resp.to_string();
+            client_sock.send_all(s.data(), s.size());
+            return;
+        }
+
+        // Dynamically clamp receive timeout so slow drips cannot exceed the absolute deadline
+        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(request_deadline - now);
+        client_sock.set_receive_timeout(std::max(std::chrono::milliseconds(1), remaining));
+
         ssize_t bytes = client_sock.receive(buffer, sizeof(buffer));
         if (bytes <= 0) {
-            // Client closed connection or timeout reached
+            // Client closed connection or receive timed out
+            break;
+        }
+
+        if (read_buffer.size() + static_cast<size_t>(bytes) > max_total_allowed) {
+            http::HttpResponse err_resp = http::HttpResponse::make_error(
+                http::StatusCode::PayloadTooLarge,
+                "Request payload exceeds configured limit"
+            );
+            std::string s = err_resp.to_string();
+            client_sock.send_all(s.data(), s.size());
             break;
         }
 
@@ -132,7 +189,7 @@ void TcpServer::handle_client(net::Socket client_sock, std::string client_ip, ui
                 // Process request through reverse proxy
                 http::HttpResponse response;
                 if (proxy_) {
-                    response = proxy_->handle_request(request, client_ip);
+                    response = proxy_->handle_request(request, client_ip, &client_sock, &read_buffer);
                 } else {
                     response = http::HttpResponse::make_error(http::StatusCode::InternalServerError, "Proxy unconfigured");
                 }
@@ -155,6 +212,8 @@ void TcpServer::handle_client(net::Socket client_sock, std::string client_ip, ui
                 }
 
                 parser.reset();
+                request_start = std::chrono::steady_clock::now();
+                request_deadline = request_start + config_.connection_timeout;
             } else if (res == http::ParseResult::Error) {
                 http::HttpResponse err_resp = http::HttpResponse::make_error(
                     parser.get_error_status(),
@@ -164,7 +223,7 @@ void TcpServer::handle_client(net::Socket client_sock, std::string client_ip, ui
                 client_sock.send_all(s.data(), s.size());
                 return;
             } else {
-                // ParseResult::Incomplete: Need more data from client
+                // ParseResult::Incomplete: Need more data from client within remaining deadline
                 break;
             }
         }

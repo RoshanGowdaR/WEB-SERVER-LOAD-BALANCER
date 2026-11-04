@@ -71,3 +71,62 @@ TEST(ThreadPoolTest, WorkerCatchesTaskExceptionSafely) {
 
     EXPECT_EQ(fut.get(), 42);
 }
+
+TEST(ThreadPoolTest, GracefulShutdownDrainsQueue) {
+    threading::ThreadPool pool(2, 20);
+    std::atomic<int> executed{0};
+
+    for (int i = 0; i < 10; ++i) {
+        pool.enqueue([&executed]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            executed++;
+        });
+    }
+
+    pool.shutdown(true); // Graceful: must drain all 10 tasks
+    EXPECT_EQ(executed.load(), 10);
+    EXPECT_TRUE(pool.is_shutdown());
+}
+
+TEST(ThreadPoolTest, ImmediateShutdownDiscardsPendingTasks) {
+    threading::ThreadPool pool(1, 20);
+    std::atomic<bool> worker_running{false};
+    std::atomic<bool> hold_worker{true};
+    std::atomic<int> executed{0};
+
+    // First task holds the only worker
+    pool.enqueue([&]() {
+        worker_running.store(true);
+        while (hold_worker.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        executed++;
+    });
+
+    while (!worker_running.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    // Enqueue 5 additional tasks that sit in queue
+    for (int i = 0; i < 5; ++i) {
+        pool.enqueue([&executed]() {
+            executed++;
+        });
+    }
+
+    // Shutdown immediately (false): should discard the 5 queued tasks
+    hold_worker.store(false);
+    pool.shutdown(false);
+
+    // Only the first active task finishes; queued 5 are discarded
+    EXPECT_EQ(executed.load(), 1);
+}
+
+TEST(ThreadPoolTest, IdempotentShutdown) {
+    threading::ThreadPool pool(2, 10);
+    pool.shutdown(true);
+    // Repeated shutdown must not throw, deadlock, or crash
+    pool.shutdown(false);
+    pool.shutdown(true);
+    EXPECT_TRUE(pool.is_shutdown());
+}

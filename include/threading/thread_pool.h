@@ -34,7 +34,7 @@ public:
 
     /**
      * @brief Enqueue a task into the thread pool.
-     * @return true if enqueued, false if rejected due to queue capacity.
+     * @return true if enqueued, false if rejected due to queue capacity or pool shutdown.
      */
     bool enqueue(std::function<void()> task);
 
@@ -58,6 +58,12 @@ public:
         return res;
     }
 
+    /**
+     * @brief Shutdown the thread pool.
+     * @param wait_for_all_tasks If true (graceful), pending queued tasks are executed before workers stop.
+     *                           If false (immediate), pending queued tasks are discarded and workers stop
+     *                           after their current task finishes.
+     */
     void shutdown(bool wait_for_all_tasks = true);
 
     [[nodiscard]] size_t worker_count() const noexcept { return workers_.size(); }
@@ -82,6 +88,8 @@ private:
     std::chrono::milliseconds enqueue_timeout_;
 
     std::atomic<bool> stop_{false};
+    std::atomic<bool> drain_queue_{true};
+    std::atomic<bool> is_joined_{false};
     std::atomic<size_t> active_workers_{0};
     std::atomic<uint64_t> completed_tasks_{0};
     std::atomic<uint64_t> rejected_tasks_{0};

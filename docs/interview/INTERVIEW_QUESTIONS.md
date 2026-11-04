@@ -1,4 +1,4 @@
-# Comprehensive Systems Engineering Interview Question Bank (65+ Questions & Answers)
+# Comprehensive Systems Engineering Interview Question Bank (80+ Questions & Answers)
 
 This question bank is curated for Senior Software Engineer, Systems Engineer, and Backend/Infrastructure roles. Every question is mapped to real-world code and engineering decisions in this project.
 
@@ -243,3 +243,99 @@ If the selected backend is marked unhealthy, the algorithm inspects the next nod
 
 ### Q65: How do you defend your choice of building this in modern C++ vs Go or Rust?
 **Answer:** Modern C++20 provides zero-cost abstractions, deterministic destructors without garbage collection pauses, and direct access to native Linux POSIX socket APIs and kernel tuning parameters. While Go uses green threads (goroutines) with a runtime scheduler and garbage collection pauses, C++ gives absolute predictability over memory layout, tail latency, and system calls.
+
+
+---
+
+## Topic 7: Advanced Engineering Remediations, Security & Protocol Deep-Dives (Questions 66–80)
+
+### Q66: Why is calling `LOG_INFO` or `Server::stop()` directly from an asynchronous signal handler undefined behavior, and how did we remediate it?
+**Code Reference:** `src/main.cpp`  
+**Answer:** In POSIX, signal handlers interrupt execution asynchronously on an arbitrary thread. Only async-signal-safe functions (like `write()`, `_exit()`, or atomic stores to `sig_atomic_t`) can be called safely. Calling `LOG_INFO` acquires a `std::mutex` and performs heap allocations; if the thread was interrupted while holding that mutex or heap lock, a permanent deadlock occurs. Furthermore, calling `Server::stop()` invokes thread joins and C++ object destructions.  
+**Remediation:** In `src/main.cpp`, we block `SIGINT` and `SIGTERM` in the main thread using `pthread_sigmask(SIG_BLOCK, &signal_set, nullptr)`. A dedicated control thread runs POSIX `sigwait(&signal_set, &sig)`. Because `sigwait` executes synchronously in normal thread context, it is 100% thread-safe to log, coordinate graceful shutdown, and join worker threads.
+
+### Q67: What is HTTP Request Smuggling and how does our parser prevent it?
+**Code Reference:** `src/http/http_parser.cpp:parse_request`, `tests/security/test_http_smuggling.cpp`  
+**Answer:** HTTP request smuggling occurs when front-end proxies and back-end servers interpret request boundaries differently (e.g. CL.TE or TE.CL desynchronization). An attacker sends ambiguous framing headers so the back-end treats part of the body as the start of a second, unauthorized request.  
+**Mitigation:** 
+1. If both `Transfer-Encoding` and `Content-Length` are present, `HttpParser` immediately rejects the request with `400 Bad Request`.
+2. All duplicate `Content-Length` headers—regardless of casing or identical values—are strictly rejected with `400 Bad Request`.
+3. Unsupported `Transfer-Encoding` values (anything other than `identity`) return `501 Not Implemented` and close the connection.
+
+### Q68: Why was `std::stoul` replaced with `std::from_chars` for Content-Length parsing?
+**Code Reference:** `src/http/http_parser.cpp`, `src/http/request.cpp`  
+**Answer:** `std::stoul` has several critical weaknesses for security-sensitive protocol parsers:
+1. It permits leading signs (`+100` or `-50`), which are forbidden in HTTP framing.
+2. It stops parsing at the first non-digit character without error (e.g. `100abc` parses as `100`), allowing smuggled data.
+3. It throws `std::invalid_argument` or `std::out_of_range`, which requires expensive C++ exception unwinding.  
+In contrast, `std::from_chars` parses strictly without heap allocation or exceptions, rejects signs on unsigned integers, and returns a pointer to the first unconsumed byte, allowing us to enforce that the entire string comprises valid decimal digits.
+
+### Q69: What are HTTP Hop-by-Hop headers and how does our reverse proxy handle them?
+**Code Reference:** `src/proxy/reverse_proxy.cpp:is_hop_by_hop_header`  
+**Answer:** Per RFC 9110 Section 7.6.1, hop-by-hop headers are meaningful only for a single transport-level connection and must not be retransmitted by proxies. These include `Connection`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Authorization`, `TE`, `Trailer`, `Transfer-Encoding`, and `Upgrade`. Additionally, any header field name listed in the comma-separated value of the client's `Connection` header is also considered hop-by-hop. In `ReverseProxy::forward_to_backend`, we parse the `Connection` header and strip all standard and connection-nominated headers before constructing the upstream request.
+
+### Q70: How does the reverse proxy protect against `X-Forwarded-For` spoofing?
+**Code Reference:** `src/proxy/reverse_proxy.cpp:forward_to_backend`  
+**Answer:** If a reverse proxy blindly appends to an incoming `X-Forwarded-For` header sent by an untrusted client (e.g. `X-Forwarded-For: 1.1.1.1`), downstream backend applications might trust the forged IP for rate limiting or ACLs. In our implementation, client-supplied `X-Forwarded-For` headers are stripped, and the proxy sets `X-Forwarded-For` strictly to the verified socket IP (`client_ip`) from `accept()`.
+
+### Q71: Why must the reverse proxy distinguish genuine EOF from socket errors on backend reads?
+**Code Reference:** `src/proxy/reverse_proxy.cpp:forward_to_backend`  
+**Answer:** When a backend returns a close-delimited response (HTTP response with no `Content-Length`), the end of the body is indicated by TCP connection termination (`recv() == 0`). If a socket read error occurs (`recv() < 0` with `ECONNRESET` or `EPIPE`), treating that error as EOF would cause the proxy to return a truncated, corrupted response to the client with `200 OK`. Our proxy checks `bytes_read`:
+- `bytes_read == 0`: genuine EOF -> parse response.
+- `bytes_read < 0` (`EAGAIN`/`EWOULDBLOCK`): timeout -> return `504 Gateway Timeout`.
+- `bytes_read < 0` (other): network error -> abort and return `502 Bad Gateway`.
+
+### Q72: How are Graceful and Immediate ThreadPool shutdown implemented?
+**Code Reference:** `src/threading/thread_pool.cpp:shutdown`  
+**Answer:**
+- **Graceful (`wait_for_all_tasks = true`):** The pool sets `stop_ = true` and `drain_queue_ = true`, waking all workers. Workers continue popping tasks until `tasks_.empty() && stop_`, ensuring all already-enqueued requests are processed before joining threads.
+- **Immediate (`wait_for_all_tasks = false`):** The pool sets `stop_ = true` and `drain_queue_ = false`, immediately clears all pending tasks from `tasks_` under lock, and notifies all workers so they terminate as soon as their currently active task finishes.
+
+### Q73: How does the HTTP response parser handle special status codes that have no message body?
+**Code Reference:** `src/http/http_parser.cpp:parse_response`  
+**Answer:** RFC 9112 Section 6.3 defines special responses that MUST NOT contain a message body:
+1. Any response to a `HEAD` request.
+2. Informational `1xx` responses (e.g. `100 Continue`).
+3. `204 No Content`.
+4. `304 Not Modified`.  
+Even if these responses include a `Content-Length` header or lack a delimiter, `HttpParser::parse_response` recognizes these codes, immediately marks parsing complete with an empty body, and sets `bytes_consumed` to the end of the header block.
+
+### Q74: How does `BackendConnectionGuard` prevent integer underflow?
+**Code Reference:** `include/balancer/load_balancer.h:BackendConnectionGuard`  
+**Answer:** In multithreaded systems, if an exception or abnormal termination decrements an unsigned counter multiple times, an unsigned 32-bit counter underflows to `4,294,967,295`, breaking Least Connections routing permanently. In `~BackendConnectionGuard()`, decrementing uses a CAS loop:
+```cpp
+uint32_t cur = backend_->active_connections.load(std::memory_order_relaxed);
+while (cur > 0 && !backend_->active_connections.compare_exchange_weak(
+       cur, cur - 1, std::memory_order_relaxed)) {}
+```
+This guarantees the counter never decrements when it is already zero.
+
+### Q75: How does the server mitigate Slowloris denial-of-service attacks?
+**Code Reference:** `src/server/tcp_server.cpp:accept_loop`, `handle_client`  
+**Answer:** A Slowloris attacker sends partial HTTP headers very slowly to hold open connection slots without completing requests. We apply two defenses:
+1. Immediately upon `accept()`, `set_receive_timeout()` and `set_send_timeout()` are configured with `config_.connection_timeout` (e.g. 5 seconds). Any slow-drip client is severed by the OS kernel when the timeout expires.
+2. In `handle_client`, `read_buffer` growth is checked: if the unparsed buffer exceeds `max_header_size + max_body_size`, the server immediately returns `413 Payload Too Large` or `431 Fields Too Large` and closes the connection.
+
+### Q76: How are Prometheus metrics formatted and escaped according to OpenMetrics?
+**Code Reference:** `src/monitoring/metrics.cpp:to_prometheus_format`  
+**Answer:** Prometheus exposition syntax requires:
+- Metric names conforming to `[a-zA-Z_:][a-zA-Z0-9_:]*`.
+- `# HELP` and `# TYPE` annotations for every metric family.
+- Label values enclosed in double quotes, with backslashes (`\\`), double quotes (`\"`), and newlines (`\n`) escaped.  
+`Metrics::to_prometheus_format` uses an internal helper to escape backend addresses and outputs standard counter and gauge families.
+
+### Q77: Why should `close(fd)` on Linux NOT be retried if it returns `EINTR`?
+**Code Reference:** `src/network/socket.cpp:close`  
+**Answer:** On Linux, POSIX specifies that by the time `close()` returns `EINTR`, the file descriptor has already been released by the kernel. If the application retries `close(fd)`, it risks closing a newly opened descriptor that was allocated to another thread in the meantime, causing catastrophic silent descriptor corruption. On Linux, `close()` should never be retried.
+
+### Q78: Why must `pthread_sigmask` block signals before creating worker threads?
+**Code Reference:** `src/main.cpp`  
+**Answer:** In POSIX, newly spawned threads inherit the signal mask of the calling thread. If signals are not blocked before starting worker threads, any worker thread could asynchronously receive `SIGINT` or `SIGTERM`. By blocking signals in `main()` before thread creation, all worker threads inherit the blocked mask, guaranteeing that only the designated thread running `sigwait()` receives and handles the signal.
+
+### Q79: What is fail-fast configuration validation and why is it preferred over silent fallback?
+**Code Reference:** `src/config/config.cpp`, `src/main.cpp`  
+**Answer:** Silent fallback to built-in defaults when a configuration file is missing or malformed is dangerous in production: a server might bind to an unexpected port or route traffic to default local backends instead of production microservices. Our implementation fails fast: if `--config` points to an unreadable or malformed file, the process logs an error and exits immediately with code 1.
+
+### Q80: How does coverage-guided fuzzing with `LLVMFuzzerTestOneInput` differ from random smoke testing?
+**Code Reference:** `tests/fuzz/fuzz_request_parser.cpp`, `tests/CMakeLists.txt`  
+**Answer:** A random test loop mutates random bytes blindly without understanding code branches. Coverage-guided fuzzing (Clang `libFuzzer`) instruments the binary during compilation using sanitizer coverage (`-fsanitize=fuzzer`). When an input discovers a new branch or code path, libFuzzer saves that input into its seed corpus and generates mutations from it. This systematically explores deep parsing edge cases (e.g. multi-byte chunk delimiters, obscure header combinations) that random loops would never discover.

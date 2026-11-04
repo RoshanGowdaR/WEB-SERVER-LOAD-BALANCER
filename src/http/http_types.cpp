@@ -29,6 +29,10 @@ Method string_to_method(std::string_view method_str) {
 
 std::string status_code_to_reason(StatusCode code) {
     switch (code) {
+        case StatusCode::Continue: return "Continue";
+        case StatusCode::SwitchingProtocols: return "Switching Protocols";
+        case StatusCode::Processing: return "Processing";
+        case StatusCode::EarlyHints: return "Early Hints";
         case StatusCode::OK: return "OK";
         case StatusCode::Created: return "Created";
         case StatusCode::Accepted: return "Accepted";
@@ -46,6 +50,7 @@ std::string status_code_to_reason(StatusCode code) {
         case StatusCode::LengthRequired: return "Length Required";
         case StatusCode::PayloadTooLarge: return "Payload Too Large";
         case StatusCode::UriTooLong: return "URI Too Long";
+        case StatusCode::ExpectationFailed: return "Expectation Failed";
         case StatusCode::RequestHeaderFieldsTooLarge: return "Request Header Fields Too Large";
         case StatusCode::InternalServerError: return "Internal Server Error";
         case StatusCode::NotImplemented: return "Not Implemented";

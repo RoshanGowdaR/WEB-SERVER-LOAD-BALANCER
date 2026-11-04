@@ -29,9 +29,18 @@ WORKDIR /app
 # Install minimal runtime dependencies (ca-certificates, curl)
 RUN apt update && apt install -y curl ca-certificates && rm -rf /var/lib/apt/lists/*
 
+# Create non-root execution user for security hardening
+RUN groupadd -r appuser && useradd -r -g appuser -s /sbin/nologin appuser
+
 # Copy compiled binary and configuration
 COPY --from=builder /app/build/load_balancer_server /app/load_balancer_server
 COPY --from=builder /app/config/config.example.json /app/config.json
+
+# Set ownership
+RUN chown -R appuser:appuser /app
+
+# Drop root privileges
+USER appuser
 
 # Expose HTTP port
 EXPOSE 8080
