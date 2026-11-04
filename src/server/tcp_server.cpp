@@ -41,11 +41,20 @@ void TcpServer::stop() {
     if (!running_.exchange(false)) return;
 
     LOG_INFO("Stopping TcpServer...");
-    listening_socket_.close();
 
+    // 1. Wake up accept thread cleanly via loopback connection without closing socket out from under it
+    if (listening_socket_.is_valid()) {
+        net::ClientSocket wake_sock;
+        wake_sock.connect(config_.host, config_.port, std::chrono::milliseconds(50));
+    }
+
+    // 2. Wait for accept thread to completely exit before closing the descriptor
     if (accept_thread_.joinable()) {
         accept_thread_.join();
     }
+
+    // 3. Close listening socket descriptor only after accept thread is joined
+    listening_socket_.close();
     LOG_INFO("TcpServer stopped.");
 }
 
@@ -55,7 +64,10 @@ void TcpServer::accept_loop() {
         pfd.fd = listening_socket_.get_fd();
         pfd.events = POLLIN;
 
-        int poll_res = ::poll(&pfd, 1, 500); // 500ms timeout for clean cancellation
+        int poll_res = ::poll(&pfd, 1, 200); // 200ms timeout for clean cancellation
+        if (!running_.load()) {
+            break;
+        }
         if (poll_res < 0) {
             if (errno == EINTR) continue;
             break;
@@ -67,6 +79,14 @@ void TcpServer::accept_loop() {
         std::string client_ip;
         uint16_t client_port = 0;
         net::Socket client_sock = listening_socket_.accept(&client_ip, &client_port);
+
+        if (!running_.load()) {
+            break;
+        }
+
+        if (!client_sock.is_valid()) {
+            continue;
+        }
 
         if (!client_sock.is_valid()) {
             if (!running_.load()) break;
@@ -169,7 +189,7 @@ void TcpServer::handle_client(net::Socket client_sock, std::string client_ip, ui
                 // Process request through reverse proxy
                 http::HttpResponse response;
                 if (proxy_) {
-                    response = proxy_->handle_request(request, client_ip);
+                    response = proxy_->handle_request(request, client_ip, &client_sock, &read_buffer);
                 } else {
                     response = http::HttpResponse::make_error(http::StatusCode::InternalServerError, "Proxy unconfigured");
                 }

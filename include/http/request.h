@@ -34,6 +34,8 @@ public:
 
     [[nodiscard]] size_t content_length() const noexcept;
     [[nodiscard]] bool is_keep_alive() const noexcept;
+    [[nodiscard]] bool expects_100_continue() const noexcept;
+    void remove_header(const std::string& key);
 
     [[nodiscard]] std::string to_string() const;
 };

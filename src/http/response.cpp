@@ -24,6 +24,10 @@ void HttpResponse::set_header(std::string key, std::string value) {
     headers[std::move(key)] = std::move(value);
 }
 
+void HttpResponse::remove_header(const std::string& key) {
+    headers.erase(key);
+}
+
 size_t HttpResponse::content_length() const noexcept {
     auto cl = get_header("Content-Length");
     if (cl) {

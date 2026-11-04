@@ -129,29 +129,66 @@ for ALGO in round_robin least_connections; do
     echo "[*] Warming up reverse proxy forwarding path ($ALGO)..."
     ab -n 500 -c 10 http://127.0.0.1:8080/api/bench > /dev/null 2>&1 || true
 
-    # Benchmark Concurrency levels: 10, 50, 100
+    # Benchmark Concurrency levels: 10, 50, 100 across 3 repetitions
     for CONCURRENCY in 10 50 100; do
         TOTAL_REQS=5000
+        echo "[*] Benchmarking Algorithm: $ALGO | Concurrency: $CONCURRENCY (3 repetitions of $TOTAL_REQS requests)..."
+
+        for REP in 1 2 3; do
+            REP_FILE="$RESULTS_DIR/ab_${ALGO}_c${CONCURRENCY}_rep${REP}.txt"
+            echo "    -> Run $REP/3..."
+            ab -n $TOTAL_REQS -c $CONCURRENCY http://127.0.0.1:8080/api/bench > "$REP_FILE" 2>&1
+        done
+
+        # Retain canonical file for backwards compatibility
         OUTPUT_FILE="$RESULTS_DIR/ab_${ALGO}_c${CONCURRENCY}.txt"
-        echo "[*] Running ApacheBench: Algorithm: $ALGO, Requests: $TOTAL_REQS, Concurrency: $CONCURRENCY..."
-        ab -n $TOTAL_REQS -c $CONCURRENCY http://127.0.0.1:8080/api/bench > "$OUTPUT_FILE" 2>&1
-        
-        # Copy to default filename for round_robin backwards compatibility
+        cp "$RESULTS_DIR/ab_${ALGO}_c${CONCURRENCY}_rep1.txt" "$OUTPUT_FILE"
         if [ "$ALGO" = "round_robin" ]; then
             cp "$OUTPUT_FILE" "$RESULTS_DIR/ab_c${CONCURRENCY}.txt"
         fi
 
-        # Extract Key Metrics
-        RPS=$(grep "Requests per second:" "$OUTPUT_FILE" | awk '{print $4}')
-        TIME_PER_REQ=$(grep "Time per request:" "$OUTPUT_FILE" | head -n 1 | awk '{print $4}')
-        FAILED_REQS=$(grep "Failed requests:" "$OUTPUT_FILE" | awk '{print $3}')
-        P95=$(grep "95%" "$OUTPUT_FILE" | awk '{print $2}')
-        P99=$(grep "99%" "$OUTPUT_FILE" | awk '{print $2}')
+        # Compute aggregate statistics over 3 runs
+        python3 - << PYEOF
+import re, math
 
-        echo "    -> Throughput: $RPS req/sec"
-        echo "    -> Mean Latency: $TIME_PER_REQ ms"
-        echo "    -> P95 Latency: $P95 ms | P99 Latency: $P99 ms"
-        echo "    -> Failed Requests: $FAILED_REQS"
+rps_vals, lat_vals, p95_vals, p99_vals = [], [], [], []
+failed_total = 0
+
+for rep in [1, 2, 3]:
+    fpath = f"$RESULTS_DIR/ab_${ALGO}_c${CONCURRENCY}_rep{rep}.txt"
+    try:
+        with open(fpath, "r") as f:
+            content = f.read()
+        m_rps = re.search(r"Requests per second:\s+([0-9.]+)", content)
+        m_lat = re.search(r"Time per request:\s+([0-9.]+)\s+\[ms\]\s+\(mean\)", content)
+        m_fail = re.search(r"Failed requests:\s+([0-9]+)", content)
+        m_p95 = re.search(r"95%\s+([0-9]+)", content)
+        m_p99 = re.search(r"99%\s+([0-9]+)", content)
+        if m_rps: rps_vals.append(float(m_rps.group(1)))
+        if m_lat: lat_vals.append(float(m_lat.group(1)))
+        if m_p95: p95_vals.append(float(m_p95.group(1)))
+        if m_p99: p99_vals.append(float(m_p99.group(1)))
+        if m_fail: failed_total += int(m_fail.group(1))
+    except Exception:
+        pass
+
+def stats(vals):
+    if not vals: return 0.0, 0.0, 0.0, 0.0
+    mean = sum(vals) / len(vals)
+    var = sum((x - mean)**2 for x in vals) / len(vals)
+    return mean, math.sqrt(var), min(vals), max(vals)
+
+m_rps, sd_rps, min_rps, max_rps = stats(rps_vals)
+m_lat, sd_lat, min_lat, max_lat = stats(lat_vals)
+m_p95 = sum(p95_vals) / len(p95_vals) if p95_vals else 0.0
+m_p99 = sum(p99_vals) / len(p99_vals) if p99_vals else 0.0
+
+print(f"    [AGGREGATE 3-RUN SUMMARY]")
+print(f"      Throughput (req/s): Mean={m_rps:.2f} (±{sd_rps:.2f}) [Min={min_rps:.2f}, Max={max_rps:.2f}]")
+print(f"      Latency (ms)      : Mean={m_lat:.2f} ms (±{sd_lat:.2f}) [Min={min_lat:.2f}, Max={max_lat:.2f}]")
+print(f"      Tail Latency (ms) : P95={m_p95:.1f} ms | P99={m_p99:.1f} ms")
+print(f"      Failed Requests   : {failed_total} total across 3 runs")
+PYEOF
     done
 
     # Gracefully stop the load balancer before switching algorithms

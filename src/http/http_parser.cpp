@@ -145,6 +145,22 @@ ParseResult HttpParser::parse_request(std::string_view data, HttpRequest& out_re
         }
     }
 
+    // Validate Expect header per RFC 9110 Section 10.1.1
+    auto expect_hdr = out_request.get_header("Expect");
+    if (expect_hdr.has_value()) {
+        std::string exp_val = std::string(trim_whitespace(*expect_hdr));
+        std::string exp_lower;
+        exp_lower.resize(exp_val.size());
+        std::transform(exp_val.begin(), exp_val.end(), exp_lower.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        if (exp_lower != "100-continue") {
+            error_status_ = StatusCode::ExpectationFailed;
+            error_message_ = "Expectation Failed: Unsupported Expect header value: " + exp_val;
+            return ParseResult::Error;
+        }
+    }
+
     // Framing verification: Conflicting Transfer-Encoding and Content-Length is request smuggling risk
     bool has_te = out_request.has_header("Transfer-Encoding");
     bool has_cl = out_request.has_header("Content-Length");
@@ -157,9 +173,15 @@ ParseResult HttpParser::parse_request(std::string_view data, HttpRequest& out_re
 
     if (has_te) {
         auto te = out_request.get_header("Transfer-Encoding").value_or("");
-        if (!te.empty() && te != "identity") {
+        std::string te_lower = std::string(trim_whitespace(te));
+        std::transform(te_lower.begin(), te_lower.end(), te_lower.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        if (te_lower == "chunked") {
+            return decode_chunked_body(data, header_end + delimiter_len, out_request.body, bytes_consumed, out_request.headers, false);
+        } else if (!te_lower.empty() && te_lower != "identity") {
             error_status_ = StatusCode::NotImplemented;
-            error_message_ = "Unsupported Transfer-Encoding; chunked transfer encoding is not supported.";
+            error_message_ = "Unsupported Transfer-Encoding; chunked transfer encoding is supported.";
             return ParseResult::Error;
         }
     }
@@ -202,6 +224,17 @@ ParseResult HttpParser::parse_request(std::string_view data, HttpRequest& out_re
 
     size_t total_required = header_end + delimiter_len + content_length;
     if (data.size() < total_required) {
+        if (out_request.expects_100_continue()) {
+            size_t available_body = (data.size() > header_end + delimiter_len) ? (data.size() - (header_end + delimiter_len)) : 0;
+            size_t to_take = std::min(available_body, content_length);
+            if (to_take > 0) {
+                out_request.body = std::string(data.substr(header_end + delimiter_len, to_take));
+            } else {
+                out_request.body.clear();
+            }
+            bytes_consumed = header_end + delimiter_len + to_take;
+            return ParseResult::Complete;
+        }
         return ParseResult::Incomplete;
     }
 
@@ -467,9 +500,15 @@ ParseResult HttpParser::parse_response(
 
     if (has_te) {
         auto te = out_response.get_header("Transfer-Encoding").value_or("");
-        if (!te.empty() && te != "identity") {
+        std::string te_lower = std::string(trim_whitespace(te));
+        std::transform(te_lower.begin(), te_lower.end(), te_lower.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        if (te_lower == "chunked") {
+            return decode_chunked_body(data, header_end + delimiter_len, out_response.body, bytes_consumed, out_response.headers, true);
+        } else if (!te_lower.empty() && te_lower != "identity") {
             error_status_ = StatusCode::BadGateway;
-            error_message_ = "Chunked or unsupported Transfer-Encoding from backend is not supported; Content-Length framing required.";
+            error_message_ = "Unsupported Transfer-Encoding from backend: " + te;
             return ParseResult::Error;
         }
     }
@@ -584,6 +623,192 @@ bool HttpParser::parse_status_line(std::string_view line, HttpResponse& resp) {
 
     resp.status_code = static_cast<StatusCode>(code);
     return true;
+}
+
+ParseResult HttpParser::decode_chunked_body(
+    std::string_view data,
+    size_t body_start_pos,
+    std::string& out_decoded_body,
+    size_t& out_total_consumed,
+    HeaderMap& headers,
+    bool is_response
+) {
+    size_t pos = body_start_pos;
+    std::string decoded;
+    decoded.reserve(std::min(data.size() - body_start_pos, max_body_size_));
+
+    while (true) {
+        if (pos >= data.size()) {
+            return ParseResult::Incomplete;
+        }
+
+        // Search for CRLF or LF ending the chunk-size line
+        size_t line_end = data.find("\r\n", pos);
+        size_t delim_len = 2;
+        if (line_end == std::string_view::npos) {
+            line_end = data.find('\n', pos);
+            delim_len = 1;
+        }
+        if (line_end == std::string_view::npos) {
+            // Check if chunk header line is suspiciously long
+            if (data.size() - pos > 1024) {
+                error_status_ = is_response ? StatusCode::BadGateway : StatusCode::BadRequest;
+                error_message_ = "Chunk header line exceeded maximum allowed length.";
+                return ParseResult::Error;
+            }
+            return ParseResult::Incomplete;
+        }
+
+        std::string_view chunk_header = data.substr(pos, line_end - pos);
+        // Strip chunk extensions: chunk-ext = *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] )
+        size_t ext_pos = chunk_header.find(';');
+        std::string_view size_str = (ext_pos == std::string_view::npos) ? chunk_header : chunk_header.substr(0, ext_pos);
+        size_str = trim_whitespace(size_str);
+
+        if (size_str.empty()) {
+            error_status_ = is_response ? StatusCode::BadGateway : StatusCode::BadRequest;
+            error_message_ = "Empty chunk size in chunked encoding.";
+            return ParseResult::Error;
+        }
+
+        // Limit hex string length to prevent overflow (16 hex digits = 64-bit uint)
+        if (size_str.size() > 16) {
+            error_status_ = is_response ? StatusCode::BadGateway : StatusCode::PayloadTooLarge;
+            error_message_ = "Chunk size integer overflow detected.";
+            return ParseResult::Error;
+        }
+
+        for (char c : size_str) {
+            if (!std::isxdigit(static_cast<unsigned char>(c))) {
+                error_status_ = is_response ? StatusCode::BadGateway : StatusCode::BadRequest;
+                error_message_ = "Invalid hex character in chunk size: " + std::string(size_str);
+                return ParseResult::Error;
+            }
+        }
+
+        size_t chunk_size = 0;
+        auto [ptr, ec] = std::from_chars(size_str.data(), size_str.data() + size_str.size(), chunk_size, 16);
+        if (ec != std::errc{} || ptr != size_str.data() + size_str.size()) {
+            error_status_ = is_response ? StatusCode::BadGateway : StatusCode::BadRequest;
+            error_message_ = "Failed to parse hex chunk size: " + std::string(size_str);
+            return ParseResult::Error;
+        }
+
+        if (chunk_size > max_body_size_) {
+            error_status_ = is_response ? StatusCode::BadGateway : StatusCode::PayloadTooLarge;
+            error_message_ = "Individual chunk size exceeds maximum allowed body size.";
+            return ParseResult::Error;
+        }
+
+        pos = line_end + delim_len;
+
+        // Terminal chunk: size == 0
+        if (chunk_size == 0) {
+            // Parse trailer fields until terminal empty line CRLF / LF
+            while (true) {
+                if (pos >= data.size()) {
+                    return ParseResult::Incomplete;
+                }
+
+                size_t trailer_end = data.find("\r\n", pos);
+                size_t t_delim = 2;
+                if (trailer_end == std::string_view::npos) {
+                    trailer_end = data.find('\n', pos);
+                    t_delim = 1;
+                }
+                if (trailer_end == std::string_view::npos) {
+                    return ParseResult::Incomplete;
+                }
+
+                std::string_view trailer_line = trim_crlf(data.substr(pos, trailer_end - pos));
+                pos = trailer_end + t_delim;
+
+                if (trailer_line.empty()) {
+                    // Terminal CRLF reached!
+                    out_decoded_body = std::move(decoded);
+                    out_total_consumed = pos;
+
+                    // Safe framing conversion: remove Transfer-Encoding, set Content-Length
+                    for (auto it = headers.begin(); it != headers.end(); ) {
+                        std::string k_lower;
+                        k_lower.resize(it->first.size());
+                        std::transform(it->first.begin(), it->first.end(), k_lower.begin(), [](unsigned char c) {
+                            return static_cast<char>(std::tolower(c));
+                        });
+                        if (k_lower == "transfer-encoding") {
+                            it = headers.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                    headers["Content-Length"] = std::to_string(out_decoded_body.size());
+                    return ParseResult::Complete;
+                }
+
+                // Parse trailer field
+                size_t colon = trailer_line.find(':');
+                if (colon == std::string_view::npos || colon == 0) {
+                    error_status_ = is_response ? StatusCode::BadGateway : StatusCode::BadRequest;
+                    error_message_ = "Malformed trailer field in chunked encoding.";
+                    return ParseResult::Error;
+                }
+
+                std::string_view t_name = trim_whitespace(trailer_line.substr(0, colon));
+                std::string_view t_val = trim_whitespace(trailer_line.substr(colon + 1));
+                if (!is_valid_token(t_name)) {
+                    error_status_ = is_response ? StatusCode::BadGateway : StatusCode::BadRequest;
+                    error_message_ = "Invalid trailer field name.";
+                    return ParseResult::Error;
+                }
+
+                std::string t_name_lower;
+                t_name_lower.resize(t_name.size());
+                std::transform(t_name.begin(), t_name.end(), t_name_lower.begin(), [](unsigned char c) {
+                    return static_cast<char>(std::tolower(c));
+                });
+
+                // RFC 9112 Section 7.1.2: Forbidden trailer fields
+                if (t_name_lower == "transfer-encoding" || t_name_lower == "content-length" ||
+                    t_name_lower == "host" || t_name_lower == "trailer") {
+                    error_status_ = is_response ? StatusCode::BadGateway : StatusCode::BadRequest;
+                    error_message_ = "Forbidden trailer field: " + std::string(t_name);
+                    return ParseResult::Error;
+                }
+
+                headers[std::string(t_name)] = std::string(t_val);
+            }
+        }
+
+        // Non-terminal chunk
+        if (decoded.size() + chunk_size > max_body_size_) {
+            error_status_ = is_response ? StatusCode::BadGateway : StatusCode::PayloadTooLarge;
+            error_message_ = "Aggregate chunked body size exceeds maximum allowed size.";
+            return ParseResult::Error;
+        }
+
+        // Need chunk_size bytes plus trailing delimiter
+        if (data.size() < pos + chunk_size + 1) {
+            return ParseResult::Incomplete;
+        }
+
+        std::string_view remaining_after_chunk = data.substr(pos + chunk_size);
+        size_t chunk_delim_len = 0;
+        if (remaining_after_chunk.starts_with("\r\n")) {
+            chunk_delim_len = 2;
+        } else if (remaining_after_chunk.starts_with("\n")) {
+            chunk_delim_len = 1;
+        } else {
+            if (remaining_after_chunk.size() == 1 && remaining_after_chunk[0] == '\r') {
+                return ParseResult::Incomplete;
+            }
+            error_status_ = is_response ? StatusCode::BadGateway : StatusCode::BadRequest;
+            error_message_ = "Missing CRLF delimiter after chunk data.";
+            return ParseResult::Error;
+        }
+
+        decoded.append(data.substr(pos, chunk_size));
+        pos += chunk_size + chunk_delim_len;
+    }
 }
 
 } // namespace http

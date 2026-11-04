@@ -53,6 +53,14 @@ private:
     bool parse_request_line(std::string_view line, HttpRequest& req);
     bool parse_headers(std::string_view header_block, HeaderMap& headers, bool is_response = false);
     bool parse_status_line(std::string_view line, HttpResponse& resp);
+    ParseResult decode_chunked_body(
+        std::string_view data,
+        size_t body_start_pos,
+        std::string& out_decoded_body,
+        size_t& out_total_consumed,
+        HeaderMap& headers,
+        bool is_response
+    );
 };
 
 } // namespace http

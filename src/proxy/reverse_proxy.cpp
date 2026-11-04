@@ -67,7 +67,9 @@ ReverseProxy::ReverseProxy(
 
 http::HttpResponse ReverseProxy::handle_request(
     const http::HttpRequest& request,
-    const std::string& client_ip
+    const std::string& client_ip,
+    net::Socket* client_sock,
+    std::string* client_read_buf
 ) {
     auto start_time = std::chrono::steady_clock::now();
     monitoring::Metrics::instance().record_request_start();
@@ -123,7 +125,7 @@ http::HttpResponse ReverseProxy::handle_request(
     }
 
     // 3. Forward request to backend
-    http::HttpResponse resp = forward_to_backend(request, backend, client_ip);
+    http::HttpResponse resp = forward_to_backend(request, backend, client_ip, client_sock, client_read_buf);
 
     bool is_success = (static_cast<int>(resp.status_code) < 500);
     auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start_time);
@@ -135,7 +137,9 @@ http::HttpResponse ReverseProxy::handle_request(
 http::HttpResponse ReverseProxy::forward_to_backend(
     const http::HttpRequest& request,
     const std::shared_ptr<balancer::BackendServer>& backend,
-    const std::string& client_ip
+    const std::string& client_ip,
+    net::Socket* client_sock,
+    std::string* client_read_buf
 ) {
     // RAII guard for tracking active connections on the backend (with underflow protection)
     balancer::BackendConnectionGuard conn_guard(backend);
@@ -203,6 +207,14 @@ http::HttpResponse ReverseProxy::forward_to_backend(
 
     // Force backend connection close to keep request lifecycle simple and avoid desync bugs
     fwd_req.set_header("Connection", "close");
+
+    bool streaming_body_after_100 = false;
+    if (client_sock && request.expects_100_continue() && request.content_length() > request.body.size()) {
+        streaming_body_after_100 = true;
+        fwd_req.body.clear();
+        fwd_req.set_header("Content-Length", std::to_string(request.content_length()));
+        fwd_req.set_header("Expect", "100-continue");
+    }
 
     std::string req_str = fwd_req.to_string();
     backend_sock.set_send_timeout(config_.backend_timeout);
@@ -272,6 +284,61 @@ http::HttpResponse ReverseProxy::forward_to_backend(
 
                 // Handle interim informational responses (100 Continue, 102 Processing, 103 Early Hints)
                 if (code >= 100 && code < 200) {
+                    // Forward interim response to client if client socket is available
+                    if (client_sock) {
+                        std::string interim_str = backend_response.to_string();
+                        if (client_sock->send_all(interim_str.data(), interim_str.size()) <= 0) {
+                            LOG_ERROR("Failed to forward informational response (" << code << ") to client.");
+                            return http::HttpResponse::make_error(http::StatusCode::BadGateway, "Client disconnected during interim response forwarding");
+                        }
+                    }
+
+                    // If this was 100 Continue and we are waiting to stream the client body to the backend:
+                    if (code == 100 && streaming_body_after_100) {
+                        streaming_body_after_100 = false;
+                        size_t total_expected = request.content_length();
+                        size_t total_sent = 0;
+
+                        // 1. Send any initial body bytes that were already in request.body
+                        if (!request.body.empty()) {
+                            if (backend_sock.send_all(request.body.data(), request.body.size()) <= 0) {
+                                backend->total_failures++;
+                                return http::HttpResponse::make_error(http::StatusCode::BadGateway, "Failed to stream initial body to upstream");
+                            }
+                            total_sent += request.body.size();
+                        }
+
+                        // 2. Send any bytes that were buffered in client_read_buf
+                        if (client_read_buf && !client_read_buf->empty()) {
+                            size_t to_take = std::min(client_read_buf->size(), total_expected - total_sent);
+                            if (to_take > 0) {
+                                if (backend_sock.send_all(client_read_buf->data(), to_take) <= 0) {
+                                    backend->total_failures++;
+                                    return http::HttpResponse::make_error(http::StatusCode::BadGateway, "Failed to stream buffered body to upstream");
+                                }
+                                total_sent += to_take;
+                                client_read_buf->erase(0, to_take);
+                            }
+                        }
+
+                        // 3. Read remaining body from client_sock and stream directly to backend_sock
+                        char body_chunk[4096];
+                        while (total_sent < total_expected) {
+                            size_t to_read = std::min(sizeof(body_chunk), total_expected - total_sent);
+                            ssize_t n = client_sock->receive(body_chunk, to_read);
+                            if (n <= 0) {
+                                LOG_ERROR("Client disconnected or timed out while streaming request body after 100 Continue.");
+                                return http::HttpResponse::make_error(http::StatusCode::BadRequest, "Client closed connection while transmitting body");
+                            }
+                            if (backend_sock.send_all(body_chunk, static_cast<size_t>(n)) <= 0) {
+                                backend->total_failures++;
+                                LOG_ERROR("Failed to send request body chunk to backend.");
+                                return http::HttpResponse::make_error(http::StatusCode::BadGateway, "Upstream write error during body transmission");
+                            }
+                            total_sent += static_cast<size_t>(n);
+                        }
+                    }
+
                     response_buf.erase(0, consumed);
                     parser.reset();
                     continue; // Re-check if final response is already present in buffer

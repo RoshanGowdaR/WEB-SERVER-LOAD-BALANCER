@@ -256,13 +256,110 @@ TEST(HttpParserTest, ParseBackendResponseInformational1xx) {
     EXPECT_TRUE(resp103.body.empty());
 }
 
-TEST(HttpParserTest, RejectBackendChunkedTransferEncoding) {
+TEST(HttpParserTest, ParseBackendChunkedTransferEncoding) {
     http::HttpParser parser;
     std::string raw = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
     http::HttpResponse resp;
     size_t consumed = 0;
+    EXPECT_EQ(parser.parse_response(raw, resp, consumed), http::ParseResult::Complete);
+    EXPECT_EQ(resp.body, "hello");
+    EXPECT_EQ(resp.get_header("Content-Length").value_or(""), "5");
+    EXPECT_FALSE(resp.has_header("Transfer-Encoding"));
+    EXPECT_EQ(consumed, raw.size());
+}
+
+TEST(HttpParserTest, ParseRequestChunkedTransferEncoding) {
+    http::HttpParser parser;
+    std::string raw = "POST /api/upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n"
+                      "4\r\nWiki\r\n"
+                      "6\r\npedia \r\n"
+                      "0\r\n\r\n";
+    http::HttpRequest req;
+    size_t consumed = 0;
+    EXPECT_EQ(parser.parse_request(raw, req, consumed), http::ParseResult::Complete);
+    EXPECT_EQ(req.body, "Wikipedia ");
+    EXPECT_EQ(req.get_header("Content-Length").value_or(""), "10");
+    EXPECT_FALSE(req.has_header("Transfer-Encoding"));
+    EXPECT_EQ(consumed, raw.size());
+}
+
+TEST(HttpParserTest, ParseChunkedWithExtensionsAndTrailers) {
+    http::HttpParser parser;
+    std::string raw = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                      "5;ext=foo;bar=baz\r\nhello\r\n"
+                      "0\r\n"
+                      "Expires: Wed, 21 Oct 2025 07:28:00 GMT\r\n"
+                      "X-Custom-Trailer: valid-trailer\r\n"
+                      "\r\n";
+    http::HttpResponse resp;
+    size_t consumed = 0;
+    EXPECT_EQ(parser.parse_response(raw, resp, consumed), http::ParseResult::Complete);
+    EXPECT_EQ(resp.body, "hello");
+    EXPECT_EQ(resp.get_header("Expires").value_or(""), "Wed, 21 Oct 2025 07:28:00 GMT");
+    EXPECT_EQ(resp.get_header("X-Custom-Trailer").value_or(""), "valid-trailer");
+    EXPECT_EQ(resp.get_header("Content-Length").value_or(""), "5");
+    EXPECT_FALSE(resp.has_header("Transfer-Encoding"));
+}
+
+TEST(HttpParserTest, RejectForbiddenTrailersInChunkedEncoding) {
+    http::HttpParser parser;
+    // Trailer containing forbidden Transfer-Encoding
+    std::string raw_te = "POST /data HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n"
+                         "4\r\ntest\r\n0\r\nTransfer-Encoding: chunked\r\n\r\n";
+    http::HttpRequest req;
+    size_t consumed = 0;
+    EXPECT_EQ(parser.parse_request(raw_te, req, consumed), http::ParseResult::Error);
+    EXPECT_EQ(parser.get_error_status(), http::StatusCode::BadRequest);
+
+    // Trailer containing forbidden Content-Length
+    std::string raw_cl = "POST /data HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n"
+                         "4\r\ntest\r\n0\r\nContent-Length: 4\r\n\r\n";
+    parser.reset();
+    EXPECT_EQ(parser.parse_request(raw_cl, req, consumed), http::ParseResult::Error);
+    EXPECT_EQ(parser.get_error_status(), http::StatusCode::BadRequest);
+}
+
+TEST(HttpParserTest, RejectMalformedChunkSize) {
+    http::HttpParser parser;
+    // Non-hex chunk size
+    std::string raw = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nhello\r\n0\r\n\r\n";
+    http::HttpResponse resp;
+    size_t consumed = 0;
     EXPECT_EQ(parser.parse_response(raw, resp, consumed), http::ParseResult::Error);
     EXPECT_EQ(parser.get_error_status(), http::StatusCode::BadGateway);
+}
+
+TEST(HttpParserTest, RejectOversizedAggregateChunkedBody) {
+    http::HttpParser parser(8192, 10); // max body size 10 bytes
+    std::string raw = "POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n"
+                      "8\r\n12345678\r\n"
+                      "8\r\n12345678\r\n"
+                      "0\r\n\r\n";
+    http::HttpRequest req;
+    size_t consumed = 0;
+    EXPECT_EQ(parser.parse_request(raw, req, consumed), http::ParseResult::Error);
+    EXPECT_EQ(parser.get_error_status(), http::StatusCode::PayloadTooLarge);
+}
+
+TEST(HttpParserTest, RejectUnsupportedExpectHeaderWith417) {
+    http::HttpParser parser;
+    std::string raw = "POST /upload HTTP/1.1\r\nHost: localhost\r\nExpect: 200-ok\r\nContent-Length: 5\r\n\r\nhello";
+    http::HttpRequest req;
+    size_t consumed = 0;
+    EXPECT_EQ(parser.parse_request(raw, req, consumed), http::ParseResult::Error);
+    EXPECT_EQ(parser.get_error_status(), http::StatusCode::ExpectationFailed);
+}
+
+TEST(HttpParserTest, AcceptExpect100ContinueHeaderBeforeBody) {
+    http::HttpParser parser;
+    std::string raw = "POST /upload HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: 100\r\n\r\n";
+    http::HttpRequest req;
+    size_t consumed = 0;
+    EXPECT_EQ(parser.parse_request(raw, req, consumed), http::ParseResult::Complete);
+    EXPECT_TRUE(req.expects_100_continue());
+    EXPECT_EQ(req.content_length(), 100u);
+    EXPECT_TRUE(req.body.empty());
+    EXPECT_EQ(consumed, raw.size());
 }
 
 TEST(HttpParserTest, RejectBackendUnsupportedTransferEncoding) {

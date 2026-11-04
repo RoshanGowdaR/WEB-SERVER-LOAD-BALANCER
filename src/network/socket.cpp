@@ -3,54 +3,101 @@
 #include <cerrno>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <thread>
 
 namespace net {
 
-Socket::Socket() : fd_(-1) {}
+Socket::OpGuard::OpGuard(const Socket& sock) noexcept : sock_(const_cast<Socket&>(sock)), fd_(-1) {
+    if (sock_.closing_.load(std::memory_order_acquire)) {
+        return;
+    }
+    sock_.active_ops_.fetch_add(1, std::memory_order_acquire);
+    if (sock_.closing_.load(std::memory_order_acquire)) {
+        sock_.active_ops_.fetch_sub(1, std::memory_order_release);
+        return;
+    }
+    int cur_fd = sock_.fd_.load(std::memory_order_acquire);
+    if (cur_fd < 0) {
+        sock_.active_ops_.fetch_sub(1, std::memory_order_release);
+        return;
+    }
+    fd_ = cur_fd;
+}
 
-Socket::Socket(int fd) : fd_(fd) {}
+Socket::OpGuard::~OpGuard() noexcept {
+    if (fd_ >= 0) {
+        sock_.active_ops_.fetch_sub(1, std::memory_order_release);
+    }
+}
+
+Socket::Socket() : fd_(-1), active_ops_(0), closing_(false) {}
+
+Socket::Socket(int fd) : fd_(fd), active_ops_(0), closing_(false) {}
 
 Socket::~Socket() {
     close();
 }
 
-Socket::Socket(Socket&& other) noexcept : fd_(other.fd_.exchange(-1, std::memory_order_acq_rel)) {}
+Socket::Socket(Socket&& other) noexcept
+    : fd_(other.fd_.exchange(-1, std::memory_order_acq_rel)),
+      active_ops_(0),
+      closing_(false) {}
 
 Socket& Socket::operator=(Socket&& other) noexcept {
     if (this != &other) {
         close();
         fd_.store(other.fd_.exchange(-1, std::memory_order_acq_rel), std::memory_order_release);
+        active_ops_.store(0, std::memory_order_release);
+        closing_.store(false, std::memory_order_release);
     }
     return *this;
 }
 
 void Socket::close() noexcept {
+    // 1. Mark closing to reject any new operations
+    closing_.store(true, std::memory_order_release);
+
+    // 2. Atomically take ownership of the descriptor
     int old_fd = fd_.exchange(-1, std::memory_order_acq_rel);
-    if (old_fd >= 0) {
-        ::close(old_fd);
+    if (old_fd < 0) {
+        closing_.store(false, std::memory_order_release);
+        return;
     }
+
+    // 3. Unblock any in-flight syscalls cleanly via shutdown without freeing descriptor number yet
+    if (active_ops_.load(std::memory_order_acquire) > 0) {
+        ::shutdown(old_fd, SHUT_RDWR);
+        while (active_ops_.load(std::memory_order_acquire) > 0) {
+            std::this_thread::yield();
+        }
+    }
+
+    // 4. Zero operations are now using old_fd. It is safe to close.
+    // The kernel will only reclaim this descriptor number after all operations have exited.
+    ::close(old_fd);
+    closing_.store(false, std::memory_order_release);
 }
 
 void Socket::shutdown(int how) noexcept {
-    int fd = fd_.load(std::memory_order_acquire);
-    if (fd >= 0) {
-        ::shutdown(fd, how);
+    OpGuard guard(*this);
+    if (guard.is_valid()) {
+        ::shutdown(guard.get_fd(), how);
     }
 }
 
 bool Socket::set_reuse_address(bool enable) noexcept {
-    int fd = fd_.load(std::memory_order_acquire);
-    if (fd < 0) return false;
+    OpGuard guard(*this);
+    if (!guard.is_valid()) return false;
     int opt = enable ? 1 : 0;
-    return ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == 0;
+    return ::setsockopt(guard.get_fd(), SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == 0;
 }
 
 bool Socket::set_reuse_port(bool enable) noexcept {
-    int fd = fd_.load(std::memory_order_acquire);
-    if (fd < 0) return false;
+    OpGuard guard(*this);
+    if (!guard.is_valid()) return false;
 #ifdef SO_REUSEPORT
     int opt = enable ? 1 : 0;
-    return ::setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) == 0;
+    return ::setsockopt(guard.get_fd(), SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) == 0;
 #else
     (void)enable;
     return true;
@@ -58,8 +105,9 @@ bool Socket::set_reuse_port(bool enable) noexcept {
 }
 
 bool Socket::set_non_blocking(bool enable) noexcept {
-    int fd = fd_.load(std::memory_order_acquire);
-    if (fd < 0) return false;
+    OpGuard guard(*this);
+    if (!guard.is_valid()) return false;
+    int fd = guard.get_fd();
     int flags = ::fcntl(fd, F_GETFL, 0);
     if (flags < 0) return false;
     if (enable) {
@@ -71,39 +119,40 @@ bool Socket::set_non_blocking(bool enable) noexcept {
 }
 
 bool Socket::set_tcp_nodelay(bool enable) noexcept {
-    int fd = fd_.load(std::memory_order_acquire);
-    if (fd < 0) return false;
+    OpGuard guard(*this);
+    if (!guard.is_valid()) return false;
     int opt = enable ? 1 : 0;
-    return ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt)) == 0;
+    return ::setsockopt(guard.get_fd(), IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt)) == 0;
 }
 
 bool Socket::set_receive_timeout(std::chrono::milliseconds timeout) noexcept {
-    int fd = fd_.load(std::memory_order_acquire);
-    if (fd < 0) return false;
+    OpGuard guard(*this);
+    if (!guard.is_valid()) return false;
     struct timeval tv{};
     tv.tv_sec = static_cast<time_t>(timeout.count() / 1000);
     tv.tv_usec = static_cast<suseconds_t>((timeout.count() % 1000) * 1000);
-    return ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0;
+    return ::setsockopt(guard.get_fd(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0;
 }
 
 bool Socket::set_send_timeout(std::chrono::milliseconds timeout) noexcept {
-    int fd = fd_.load(std::memory_order_acquire);
-    if (fd < 0) return false;
+    OpGuard guard(*this);
+    if (!guard.is_valid()) return false;
     struct timeval tv{};
     tv.tv_sec = static_cast<time_t>(timeout.count() / 1000);
     tv.tv_usec = static_cast<suseconds_t>((timeout.count() % 1000) * 1000);
-    return ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) == 0;
+    return ::setsockopt(guard.get_fd(), SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) == 0;
 }
 
 ssize_t Socket::send(const void* data, size_t length, int flags) noexcept {
-    int fd = fd_.load(std::memory_order_acquire);
-    if (fd < 0) return -1;
-    return ::send(fd, data, length, flags);
+    OpGuard guard(*this);
+    if (!guard.is_valid()) return -1;
+    return ::send(guard.get_fd(), data, length, flags);
 }
 
 ssize_t Socket::send_all(const void* data, size_t length) noexcept {
-    int fd = fd_.load(std::memory_order_acquire);
-    if (fd < 0) return -1;
+    OpGuard guard(*this);
+    if (!guard.is_valid()) return -1;
+    int fd = guard.get_fd();
     const char* ptr = static_cast<const char*>(data);
     size_t remaining = length;
     while (remaining > 0) {
@@ -124,18 +173,19 @@ ssize_t Socket::send_string(std::string_view data) noexcept {
 }
 
 ssize_t Socket::receive(void* buffer, size_t max_length, int flags) noexcept {
-    int fd = fd_.load(std::memory_order_acquire);
-    if (fd < 0) return -1;
+    OpGuard guard(*this);
+    if (!guard.is_valid()) return -1;
     ssize_t bytes;
     do {
-        bytes = ::recv(fd, buffer, max_length, flags);
+        bytes = ::recv(guard.get_fd(), buffer, max_length, flags);
     } while (bytes < 0 && errno == EINTR);
     return bytes;
 }
 
 ssize_t Socket::receive_all(void* buffer, size_t length) noexcept {
-    int fd = fd_.load(std::memory_order_acquire);
-    if (fd < 0) return -1;
+    OpGuard guard(*this);
+    if (!guard.is_valid()) return -1;
+    int fd = guard.get_fd();
     char* ptr = static_cast<char*>(buffer);
     size_t total_received = 0;
     while (total_received < length) {
@@ -195,15 +245,15 @@ bool ServerSocket::bind_and_listen(const std::string& host, uint16_t port, int b
 }
 
 Socket ServerSocket::accept(std::string* client_ip, uint16_t* client_port) noexcept {
-    int fd = fd_.load(std::memory_order_acquire);
-    if (fd < 0) return Socket(-1);
+    OpGuard guard(*this);
+    if (!guard.is_valid()) return Socket(-1);
 
     struct sockaddr_in client_addr{};
     socklen_t client_len = sizeof(client_addr);
     int client_fd = -1;
 
     do {
-        client_fd = ::accept(fd, reinterpret_cast<struct sockaddr*>(&client_addr), &client_len);
+        client_fd = ::accept(guard.get_fd(), reinterpret_cast<struct sockaddr*>(&client_addr), &client_len);
     } while (client_fd < 0 && errno == EINTR);
 
     if (client_fd < 0) {

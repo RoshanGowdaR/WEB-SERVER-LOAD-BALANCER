@@ -50,6 +50,7 @@ std::string status_code_to_reason(StatusCode code) {
         case StatusCode::LengthRequired: return "Length Required";
         case StatusCode::PayloadTooLarge: return "Payload Too Large";
         case StatusCode::UriTooLong: return "URI Too Long";
+        case StatusCode::ExpectationFailed: return "Expectation Failed";
         case StatusCode::RequestHeaderFieldsTooLarge: return "Request Header Fields Too Large";
         case StatusCode::InternalServerError: return "Internal Server Error";
         case StatusCode::NotImplemented: return "Not Implemented";

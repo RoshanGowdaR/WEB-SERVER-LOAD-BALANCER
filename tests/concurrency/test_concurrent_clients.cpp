@@ -140,3 +140,44 @@ TEST(ConcurrencyTest, SlowlorisAbsoluteDeadlineEnforced) {
     srv.stop();
     EXPECT_TRUE(timeout_received);
 }
+
+TEST(ConcurrencyTest, SocketDescriptorLifecycleConcurrentCloseSafety) {
+    // Verify that concurrent close() during an in-flight socket read
+    // cleanly unblocks the operation without data races or descriptor reuse races.
+    net::ServerSocket server;
+    ASSERT_TRUE(server.bind_and_listen("127.0.0.1", 0));
+    uint16_t port = server.get_bound_port();
+
+    net::ClientSocket client;
+    ASSERT_TRUE(client.connect("127.0.0.1", port, std::chrono::milliseconds(1000)));
+
+    net::Socket accepted = server.accept();
+    ASSERT_TRUE(accepted.is_valid());
+
+    std::atomic<bool> read_started{false};
+    std::atomic<bool> read_completed{false};
+    ssize_t read_result = 0;
+
+    // Thread 1: Blocking read
+    std::thread reader([&]() {
+        read_started.store(true);
+        char buf[64];
+        read_result = accepted.receive(buf, sizeof(buf));
+        read_completed.store(true);
+    });
+
+    while (!read_started.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    // Give reader thread time to enter ::recv()
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    // Thread 2: Concurrent close()
+    accepted.close();
+
+    reader.join();
+
+    EXPECT_TRUE(read_completed.load());
+    EXPECT_LE(read_result, 0); // Read returned error or EOF due to shutdown
+    EXPECT_FALSE(accepted.is_valid());
+}

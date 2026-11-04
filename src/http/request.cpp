@@ -40,6 +40,19 @@ void HttpRequest::append_header_value(const std::string& key, const std::string&
     }
 }
 
+void HttpRequest::remove_header(const std::string& key) {
+    headers.erase(key);
+}
+
+bool HttpRequest::expects_100_continue() const noexcept {
+    auto exp = get_header("Expect");
+    if (!exp) return false;
+    std::string val = *exp;
+    std::transform(val.begin(), val.end(), val.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return val.find("100-continue") != std::string::npos;
+}
+
 size_t HttpRequest::content_length() const noexcept {
     auto cl = get_header("Content-Length");
     if (cl) {
